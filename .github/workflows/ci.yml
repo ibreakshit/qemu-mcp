@@ -7,37 +7,19 @@ on:
 
 jobs:
   test:
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
-        # pyproject.toml declares requires-python = ">=3.10", but CI only ever
-        # exercised 3.12 - full cross product would be 12 jobs for one
-        # package with no OS-specific Python code, so the extra versions
-        # (3.10/3.11/3.13) run on ubuntu-latest only, catching a version
-        # incompatibility without tripling every OS's runner minutes.
-        exclude:
-          - os: windows-latest
-            python-version: "3.10"
-          - os: windows-latest
-            python-version: "3.11"
-          - os: windows-latest
-            python-version: "3.13"
-          - os: macos-latest
-            python-version: "3.10"
-          - os: macos-latest
-            python-version: "3.11"
-          - os: macos-latest
-            python-version: "3.13"
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install "ruff==0.16.0" "mypy==2.3.0" ".[test]"
+      - run: sudo apt-get update && sudo apt-get install -y libvirt-dev pkg-config
+      - run: pip install ".[test]"
       - run: ruff check src tests
       - run: mypy --strict src
-      - name: pytest (unit tests + stdio handshake, no QEMU)
-        run: pytest tests/test_keys.py tests/test_mouse.py tests/test_screen.py tests/test_snapshot.py tests/test_serial.py tests/test_qmp.py tests/test_vm.py tests/test_stdio_handshake.py tests/test_tool_hints.py tests/test_version.py -v
+      - name: Fake libvirt tests and real MCP stdio handshake (no guests)
+        run: pytest -v

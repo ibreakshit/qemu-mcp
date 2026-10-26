@@ -134,3 +134,12 @@ def test_parse_combo_empty_combo_raises(combo):
 def test_parse_combo_unknown_key_raises(combo):
     with pytest.raises(ValueError):
         parse_combo(combo)
+
+
+@pytest.mark.parametrize('alias,qcode', [
+    ('rightalt', 'alt_r'), ('ralt', 'alt_r'), ('alt_r', 'alt_r'), ('altgr', 'alt_r'),
+    ('rightctrl', 'ctrl_r'), ('rctrl', 'ctrl_r'), ('ctrl_r', 'ctrl_r'),
+    ('rightshift', 'shift_r'), ('rshift', 'shift_r'), ('shift_r', 'shift_r'),
+])
+def test_right_modifier_aliases(alias, qcode):
+    assert parse_combo(alias) == [qcode]

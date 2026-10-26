@@ -1,238 +1,82 @@
 # qemu-mcp
 
-**Let your AI agent boot an operating system and drive it.**
+A local Linux MCP controller for **existing libvirt QEMU domains**, including Windows guests. It uses libvirt for discovery, lifecycle and primary-display screenshots, and `libvirt_qemu.qemuMonitorCommand` for explicit keyboard and mouse events. It never creates guests or opens libvirt's private QMP socket.
 
-qemu-mcp is an [MCP](https://modelcontextprotocol.io) server that gives AI agents (Claude Code, or any MCP client) hands on a QEMU virtual machine: boot an ISO or a raw kernel, press keys, take screenshots, read the serial console, and wait for boot markers — all headless, with **zero cooperation from the guest**. No SSH, no guest agent, no network. If it boots in QEMU, an agent can drive it.
+Keep using virt-manager and SPICE on the same desktop. Opening or closing a viewer does not affect MCP attachments. Guest video, SPICE and input device configuration stay as configured in libvirt. Simultaneous human and agent input may interfere.
 
-<p align="center">
-  <img src="assets/demo-terminal.png" width="720" alt="MORT OS terminal after the agent typed help — captured through qemu-mcp">
-</p>
+## Install and connect
 
-*This screenshot was taken by an AI agent: it booted [MORT OS](https://github.com/0xmortuex/MortOS) (a hobby kernel with no SSH, no agent, no TCP required) headless, pressed `Esc`, typed `help`, and captured the framebuffer — four tool calls.*
+Use Linux, Python 3.10+, an accessible local libvirt QEMU daemon and existing domains. Install your distribution's libvirt development packages first, for example on Debian/Ubuntu:
 
-## Who this is for
-
-**OS developers and hobby kernel hackers.** The osdev inner loop is: edit kernel → build → boot in QEMU → *look at the screen* → type something → read serial → repeat. An AI agent can already do the edit and build steps; qemu-mcp gives it the rest of the loop, so it can boot-test its own kernel changes and actually see the triple fault.
-
-It's equally useful for anyone who needs an agent to poke at a VM below the OS level: bootloaders, installers, BIOS/UEFI menus, recovery consoles, firmware.
-
-## Why another QEMU MCP server?
-
-The existing ones assume a *full, running guest OS* — they exec commands over SSH or a guest agent. That's useless when your guest is a 40 KB kernel you wrote yourself, an installer ISO, or anything pre-boot. qemu-mcp is built for the boot-test loop instead:
-
-- **Serial console capture** — continuously logged to a file, readable at any time (`qemu_serial`), and writable too (`qemu_serial_send`)
-- **`qemu_wait_serial`** — block until `"kernel ready"` (or `"login:"`, or your panic string) appears, the reliable way to sequence an automated boot test
-- **`-kernel` boot** — boot a multiboot/bzImage kernel directly, with `append`/`initrd`
-- **Screenshots of the VGA framebuffer** — works headless, shows exactly what a monitor would
-- **Raw QMP escape hatch** — the full QEMU Machine Protocol when you need `memsave`, `system_reset`, `device_add`…
-
-## Tools
-
-| Tool | What it does |
-|------|--------------|
-| `qemu_boot` | Boot a VM headless from `iso`, `kernel` (+`append`/`initrd`), and/or `disk`. Any arch QEMU supports (`x86_64`, `i386`, `aarch64`, `riscv64`…), an optional `machine` (QEMU `-M`, required on some archs), an optional `smp` (QEMU `-smp`, number of virtual CPUs, for testing SMP-aware guest code), an optional `accel` (QEMU `-accel`, e.g. `"kvm:tcg"`/`"hvf:tcg"`/`"whpx:tcg"`, to opt into hardware acceleration), an optional `cpu` (QEMU `-cpu`, e.g. `"qemu64,+avx"`/`"max"`/`"host"`, to select or customize the emulated CPU model for testing a specific feature set), arbitrary extra QEMU args (networking, devices…), and overridable `qmp_connect_timeout_s`/`qmp_read_timeout_s` for slow hosts or long-running QMP commands |
-| `qemu_version` | Report the installed `qemu-system-<arch> --version` output, without booting a VM |
-| `qemu_screenshot` | PNG of the guest's display, straight from the framebuffer |
-| `qemu_type` | Type text as keyboard input (`\n` = Enter, shifted symbols handled, tunable keystroke delay) |
-| `qemu_key` | Press a key or chord: `enter`, `esc`, `f12`, `ctrl-alt-f2`… |
-| `qemu_mouse` | Move the absolute pointer (fractions of screen width/height) and optionally click `left`/`right`/`middle` |
-| `qemu_snapshot_save` | Save a full RAM+device snapshot under a tag (needs a qcow2 disk). Reports failure if QEMU's savevm rejects it (e.g. a raw disk) instead of claiming success |
-| `qemu_snapshot_load` | Restore a VM to a previously saved snapshot tag. Reports failure if QEMU's loadvm rejects it (e.g. an unknown tag) instead of claiming success |
-| `qemu_snapshot_delete` | Delete a previously saved snapshot tag, freeing its space in the qcow2 disk. Reports failure if QEMU's delvm rejects it (e.g. an unknown tag) instead of claiming success |
-| `qemu_snapshot_list` | List snapshot tags saved on the VM's qcow2 disk (raw `info snapshots` output), so you can see what's available before loading or deleting one |
-| `qemu_serial` | Tail the serial console (COM1) output — works after the VM has exited too, to see what it printed right before dying |
-| `qemu_serial_send` | Write text to the serial console (COM1) |
-| `qemu_wait_serial` | Block until given text appears on serial, or timeout. Each wait only searches output after the previous match, so waiting for a prompt after a command finds the new one (`from_start=True` searches the whole log) |
-| `qemu_wait_screen` | Block until the display stops changing (for VGA-only guests with no serial output), or timeout. A blinking text cursor counts as settled (`max_changed_pixels`, default 64) |
-| `qemu_list` | All managed VMs with state, arch, machine, pid, uptime |
-| `qemu_stop` | Graceful ACPI powerdown, or `force=true` to kill. `graceful_timeout_s`/`kill_timeout_s` override the default 10s/3s waits |
-| `qemu_qmp` | Run any raw QMP command on the VM |
-
-Multiple named VMs can run at once.
-
-Every tool declares all four MCP behaviour hints, so your client knows which calls to
-confirm with you. Only the waiting and reading tools (`qemu_screenshot`, `qemu_serial`,
-`qemu_wait_serial`, `qemu_wait_screen`, `qemu_snapshot_list`, `qemu_version`) are
-read-only. `qemu_boot` and `qemu_list` are marked destructive because they clean up VMs
-that exited on their own, deleting their serial logs; read a crashed guest's output with
-`qemu_serial` first. `qemu_boot` and `qemu_qmp` are open-world: `extra_args` and raw QMP
-can reach anything QEMU can.
-
-## Install
-
-Requirements: Python 3.10+, and [QEMU](https://www.qemu.org/download/) on your PATH (on Windows, `C:\Program Files\qemu` is found automatically, or set `QEMU_DIR`).
-
-```bash
-pip install git+https://github.com/0xmortuex/qemu-mcp
+```sh
+sudo apt install libvirt-dev pkg-config python3-dev
+python -m pip install .
 ```
 
-**Claude Code:**
+The host user needs permission to connect to libvirt and run QEMU monitor input commands. Configure that access using your distribution's libvirt policy. The server runs with that user's access to the guests.
 
-```bash
-claude mcp add qemu -- qemu-mcp
-```
-
-**Any other MCP client** (stdio transport):
+Configure your MCP client to launch:
 
 ```json
 {
   "mcpServers": {
     "qemu": {
-      "command": "qemu-mcp"
+      "command": "qemu-mcp",
+      "env": {"QEMU_MCP_LIBVIRT_URI": "qemu:///system"}
     }
   }
 }
 ```
 
-Or without installing, via [uv](https://docs.astral.sh/uv/): `claude mcp add qemu -- uvx --from git+https://github.com/0xmortuex/qemu-mcp qemu-mcp`
+`qemu:///system` is the default; `qemu:///session` is the only alternative. Remote connections are rejected. Launch `python -m qemu_mcp` for the same stdio server. Libvirt bindings are imported on first use, so listing MCP tools works without a local libvirt installation.
 
-## Example session
+## Workflow
 
-> **you:** boot build/os.iso and check the shell works
->
-> **agent:** `qemu_boot(name="test", iso="build/os.iso", arch="i386")` → booted
-> `qemu_wait_serial(name="test", text="boot ok")` → FOUND
-> `qemu_type(name="test", text="help\n")`
-> `qemu_screenshot(name="test")` → *sees the help output rendered*
-> `qemu_stop(name="test", force=true)`
-> "Your ISO boots, the shell responds to `help`, and the new command is listed. Screenshot attached."
+1. Call `qemu_list()` to discover running and stopped domains.
+2. Call `qemu_attach(name="Windows")` with a domain name or UUID. Attachments retain the UUID across domain renames and connection recovery. Use that UUID or the originally attached name in later calls.
+3. Capture with `qemu_screenshot`, inspect dimensions, then use input tools.
+4. Call `qemu_detach` when done. Detaching and server exit release held input best-effort and close connections, without shutting down guests.
 
-A typical kernel test the agent can run by itself:
+Stopped guests can attach for power management. `qemu_start` starts an existing attached guest. `qemu_shutdown` and `qemu_reboot` make graceful requests and return the actual current state; an accepted request may still report running. There is no forced fallback. `qemu_force_stop` explicitly invokes libvirt destroy and can lose unsaved guest work.
 
-```
-qemu_boot(name="k", kernel="build/kernel.elf", arch="i386",
-          extra_args="-device rtl8139,netdev=n0 -netdev user,id=n0")
-qemu_wait_serial(name="k", text="MORTNET READY", timeout_s=20)
-qemu_serial_send(name="k", text="net\n")  # guest has no keyboard driver, only a serial shell
-qemu_serial(name="k")          # did DHCP bind?
-qemu_screenshot(name="k")      # what does the console show?
-```
+## Tools
 
-### Non-x86 archs
+| Tool | Behavior |
+| --- | --- |
+| `qemu_list()` | All existing domains with name, UUID, state and attached status |
+| `qemu_attach(name)` | Attach by name or UUID without starting the guest |
+| `qemu_detach(name)` | Release input best-effort and detach without powering off |
+| `qemu_status(name)` | Current state and identity of an attached guest |
+| `qemu_start/shutdown/reboot/force_stop(name)` | Explicit lifecycle request and actual state |
+| `qemu_screenshot(name)` | Full-resolution primary-display PNG plus width/height |
+| `qemu_get_resolution(name)` | Width/height through the same capture path |
+| `qemu_wait_screen(name, timeout_s=30, poll_interval_s=1, stable_polls=3, max_changed_pixels=64)` | Structured settled/timeout, black-image flag and unknown readiness |
+| `qemu_type(name, text, delay_ms=35)` | Physical ANSI US key positions; returns `characters_sent`, `guest_text_verified=false`, `key_event_interval_ms=20` |
+| `qemu_key(name, combo, state='click')` | Chords such as `ctrl-alt-f1` or `rightalt`; press, release or click |
+| `qemu_release_all(name)` | Release keys/buttons held by this attachment |
+| `qemu_mouse_move(name, x, y, coordinate_mode='pixels')` | Absolute pointer movement |
+| `qemu_mouse_click(name, button='left', x=None, y=None, state='click', count=1, coordinate_mode='pixels')` | Click/double-click or press/release, with optional coordinate pair |
+| `qemu_mouse_scroll(name, delta_y, delta_x=0)` | Signed integer wheel steps; positive down/right, up to 100 per axis |
+| `qemu_mouse_drag(name, start_x, start_y, end_x, end_y, button='left', duration_ms=500, coordinate_mode='pixels')` | Serialized move, press, interpolated movement and final release |
 
-`x86_64` and `i386` boot with no `machine` argument. Other archs have no
-default machine in QEMU and need `-M` set explicitly, or they'll fail to
-boot:
+Input actions run sequentially per domain; different domains are independent. On input errors, held-input cleanup is attempted and uncertain input is never replayed automatically. Subsequent requests reconnect when the connection has failed and resolve attachments by UUID.
 
-```
-qemu_boot(name="a", kernel="build/kernel-aarch64.elf", arch="aarch64", machine="virt")
-qemu_boot(name="r", kernel="build/kernel-riscv64.elf", arch="riscv64", machine="virt")
-```
+### Input coordinates and layout
 
-Check `qemu-system-<arch> -M help` for the full list of machines an arch supports.
+The default coordinate mode is native screenshot pixels: `0 <= x <= width-1` and `0 <= y <= height-1`. Pass `coordinate_mode="normalized"` explicitly for 0..1 coordinates. Values must be finite and within bounds; there is no clamping or hidden screenshot scaling. Absolute positioning requires a suitable existing guest input device, commonly a USB tablet. The controller never adds devices or calibrates the pointer.
 
-`virt` has no default display device — unlike the PC-family boards `x86_64`/
-`i386` boot with, it doesn't wire up VGA on its own. `qemu_screenshot`/
-`qemu_wait_screen` against a `virt` VM will see an empty/black framebuffer (or
-a QMP error, depending on QEMU version) unless the guest itself sets one up,
-which most bare-metal aarch64/riscv64 kernels don't. Add a display device
-explicitly if you need screenshots:
+Text is validated in full before sending any keys. Only physical ANSI US positions are mapped; Windows or the guest owns keyboard layout and IME. There is no automatic layout change, Unicode injection or clipboard. Every keyboard press and release is spaced by at least 20 ms per domain, including modifiers, cleanup and consecutive tool calls; chords release in reverse order. `delay_ms` accepts 0..1000 (default 35) as an additional inter-character pause and cannot bypass this floor. `characters_sent` counts characters whose input events the transport accepted, with `guest_text_verified=false`; no typed content is echoed. Inspect screenshots and application counts to verify focus and delivery. The floor addresses observed USB-keyboard loss in the tested Windows guest; arbitrary guest load can still delay or lose input.
 
-```
-qemu_boot(name="a", kernel="build/kernel-aarch64.elf", arch="aarch64",
-          machine="virt", extra_args="-device virtio-gpu-pci")
-```
+Use `rightalt`, `ralt`, `alt_r` or `altgr` for QEMU's right Alt key. `right-alt` retains its chord delimiter meaning (Right arrow plus left Alt). Right Ctrl aliases are `rightctrl`/`rctrl`/`ctrl_r`, and right Shift aliases are `rightshift`/`rshift`/`shift_r`. In the tested Windows Korean IME, focus the editor first, toggle with `rightalt`, type two-set physical keys and commit composition with space or Enter, then toggle back to English. Clicking the taskbar IME control followed by an editor click can reset the mode in this guest; the controller does not change language automatically.
 
-(This is documented QEMU `virt`-board behavior, not verified against a real
-boot in this environment — no QEMU available here.)
+Mouse buttons are left/right/middle; click count is 1 or 2, held states require 1. Drag duration is 0..10000 ms.
 
-### Hardware acceleration
+### Screens and readiness
 
-`qemu_boot` defaults to TCG (QEMU's software emulator) with no `accel` given -
-correct on any host, but a real slowdown for anything beyond a trivial kernel.
-Opt into your host's accelerator with `accel`, falling back to TCG if it's
-unavailable so the boot doesn't hard-fail on a host without it:
+Screenshots are read-only and never wake the display. A black frame can mean display sleep. Send explicit input if you want to wake the guest, then allow it to settle. `qemu_wait_screen` measures image stability, not application or OS readiness, and always reports `readiness="unknown"`. Its timeout is 0.01..300 seconds, polling interval 0.01..300 seconds, and stable polls 1..1000. Synchronous libvirt calls remain subject to the daemon's own response time.
 
-```
-qemu_boot(name="fast", kernel="build/kernel.elf", accel="kvm:tcg")   # Linux
-qemu_boot(name="fast", kernel="build/kernel.elf", accel="hvf:tcg")   # macOS
-qemu_boot(name="fast", kernel="build/kernel.elf", accel="whpx:tcg")  # Windows
-```
+## Compatibility and testing
 
-If the requested accelerator genuinely isn't usable on the host (no `/dev/kvm`
-permission, virtualization disabled in firmware, etc.) QEMU itself reports why
-QEMU exited, and `qemu_boot` surfaces that in the error it raises.
+Version remains 0.1.0 for this MVP, with an intentional interface break. Boot, QEMU-version, serial, snapshots, raw-QMP and the old combined mouse/stop tools have been removed. There is no VM creation, guest agent, clipboard, guest command execution or file transfer.
 
-### CPU model
-
-`qemu_boot` defaults to QEMU's own default CPU model for the arch/machine.
-Pass `cpu` (QEMU `-cpu`) to test guest code against a specific model or
-feature set instead:
-
-```
-qemu_boot(name="k", kernel="build/kernel.elf", cpu="qemu64,+avx")  # base model + one extra feature
-qemu_boot(name="k", kernel="build/kernel.elf", cpu="max")          # every feature QEMU/TCG can emulate
-qemu_boot(name="k", kernel="build/kernel.elf", accel="kvm", cpu="host")  # pass the host CPU through under KVM
-```
-
-Check `qemu-system-<arch> -cpu help` for the full list of models/features an
-arch supports.
-
-## Debugging the kernel
-
-qemu-mcp lets an agent *see* a crash. To find out *why* it happened, pair it with
-[gdbstub-mcp](https://github.com/0xmortuex/gdbstub-mcp). Boot with QEMU's gdbstub on
-and an interrupt log:
-
-```python
-qemu_boot(name="k", kernel="build/kernel.elf",
-          extra_args="-s -S -d int,cpu_reset -D int.log -no-reboot")
-```
-
-Then the agent can `debug_connect` with the kernel ELF, set breakpoints on symbols
-or `file.c:line`, read registers and memory, and get backtraces. If the VM triple
-faults, `debug_explain_fault` turns `int.log` into the exception chain and its root
-cause. No gdb binary is needed.
-
-## Tests
-
-[![CI](https://github.com/0xmortuex/qemu-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/0xmortuex/qemu-mcp/actions/workflows/ci.yml)
-
-Unit tests for the character/key-name -> QMP qcode translation in `keys.py`,
-the screen-fraction -> QMP pointer-event translation in `mouse.py`, the
-serial chardev args and reconnect logic in `serial.py`, the framebuffer
-stability tracker in `screen.py`, the snapshot tag validation and HMP
-command-line building in `snapshot.py`, the QMP client's error handling in
-`qmp.py`, the missing-binary error path, the `__version__`/`pyproject.toml`
-version-drift guard in `test_version.py`, the pinned tool behaviour hints
-(readOnlyHint/destructiveHint/idempotentHint/openWorldHint) in
-`test_tool_hints.py`, and an MCP stdio handshake smoke test all need no QEMU
-install - this is what CI runs on every push:
-
-```bash
-pip install -e ".[test]"
-ruff check src tests
-mypy --strict src
-pytest tests/test_keys.py tests/test_mouse.py tests/test_screen.py tests/test_snapshot.py tests/test_serial.py tests/test_qmp.py tests/test_vm.py tests/test_stdio_handshake.py tests/test_tool_hints.py tests/test_version.py
-```
-
-There's also an end-to-end test that boots a real ISO and exercises every tool:
-
-```bash
-QEMU_MCP_TEST_ISO=path/to/anything-bootable.iso python tests/smoke_test.py
-```
-
-`qemu_snapshot_save`/`qemu_snapshot_load` need a qcow2 disk rather than an
-ISO, so they're only exercised if you also set `QEMU_MCP_TEST_QCOW2` to a
-qcow2 disk image (booted as a second VM alongside the ISO one).
-
-## Notes
-
-- VMs run headless (`-display none`); screenshots still work because QEMU keeps rendering the VGA framebuffer.
-- Serial output requires the guest to write to COM1 (most hobby kernels and all Linux `console=ttyS0` setups do). Guests that only draw to VGA are still fully drivable via screenshots + keys.
-- `qemu_stop` tries ACPI powerdown first; hobby kernels usually ignore it and get killed after a grace period — use `force=true` to skip the wait, or raise `graceful_timeout_s` (default 10s) for a guest that legitimately needs longer to shut down cleanly.
-- `qemu_stop` waits briefly (up to 5s, best-effort) for any in-flight `qemu_wait_serial`/`qemu_wait_screen`/`qemu_screenshot`/`qemu_serial_send`/`qemu_qmp` call against the same VM to finish before closing its QMP/serial connections and removing its temp directory, so a call racing a concurrent stop sees a clean result instead of an error from a handle closed out from under it.
-- This server launches QEMU processes on your machine with files you point it at. `extra_args` is passed to QEMU verbatim — same trust level as running QEMU yourself.
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md).
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the exact local setup and checks
-CI runs.
-
-## License
-
-MIT
+See [CONTRIBUTING.md](CONTRIBUTING.md) for offline tests and the opt-in existing-guest exercise. Known limitations and post-test-drive follow-ups are in [docs/testing/mvp-deferred-issues.md](docs/testing/mvp-deferred-issues.md).

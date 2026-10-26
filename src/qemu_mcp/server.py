@@ -1,578 +1,189 @@
-"""qemu-mcp: an MCP server that lets an AI agent boot and drive QEMU VMs."""
-
+"""Thin MCP handlers for the local libvirt controller."""
 from __future__ import annotations
 
 import functools
-import io
 import json
 import os
-import tempfile
-import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import Any, TypeVar
 
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
-from . import keys as keymod
-from . import mouse as mousemod
-from . import screen as screenmod
-from . import snapshot as snapmod
-from . import vm as vmmod
-from .serial import SerialError
+from .backend import LibvirtBackend
+from .vm import Controller
 
-mcp = MCPServer(
-    "qemu",
-    instructions=(
-        "Boot and drive QEMU virtual machines: boot an ISO/kernel/disk, "
-        "type into the guest, take screenshots, read the serial console, "
-        "and wait for boot markers. Typical loop: qemu_boot -> "
-        "qemu_wait_serial or a short pause -> qemu_screenshot -> "
-        "qemu_type / qemu_key -> qemu_screenshot -> qemu_stop. "
-        "Screenshots show the guest's VGA display even though the VM "
-        "runs headless."
-    ),
-)
-
-F = TypeVar("F", bound=Callable[..., Any])
-
-# Failures an agent can act on ("no VM named X", "VM has exited. Last serial
-# output: ...", "qemu-system-foo not found. Found on this system: ..."). The
-# MCP server only forwards a ToolError's message to the client - anything
-# else arrives as a bare "Error executing tool X" - so these are re-raised as
-# ToolError with their text intact. QMPError is a RuntimeError.
-_EXPECTED = (KeyError, ValueError, FileNotFoundError, RuntimeError, SerialError, OSError)
+# Importing/registering tools never opens a libvirt connection.
+controller = Controller(LibvirtBackend(os.environ.get('QEMU_MCP_LIBVIRT_URI', 'qemu:///system')))
 
 
-def tool(*, read_only: bool, destructive: bool, idempotent: bool,
-         open_world: bool) -> Callable[[F], F]:
-    """Register fn as an MCP tool with all four behaviour hints stated.
+@asynccontextmanager
+async def lifespan(server: MCPServer[Any]) -> AsyncIterator[None]:
+    try:
+        yield None
+    finally:
+        controller.close()
 
-    The hints are required so no tool can be added without saying what it
-    does to the world: clients use them to decide when to ask the user
-    first. tests/test_tool_hints.py pins every tool's values.
-    """
-    annotations = ToolAnnotations(read_only_hint=read_only, destructive_hint=destructive,
-                                  idempotent_hint=idempotent, open_world_hint=open_world)
 
-    def register(fn: F) -> F:
-        @functools.wraps(fn)
+mcp = MCPServer('qemu', version='0.1.0', lifespan=lifespan, instructions=(
+    'Control existing local libvirt domains. Use qemu_list, qemu_attach, '
+    'qemu_screenshot, then input tools. Attach stopped guests for power management. '
+    'Detaching or exiting never stops a guest. Coordinates default to native '
+    'screenshot pixels; normalized coordinates must be explicit. Text uses '
+    'physical ANSI US key positions; the guest owns layout and IME. Screenshots '
+    'never wake displays. A stable or black image does not prove guest readiness. '
+    'SPICE/virt-manager can stay open; simultaneous human input may interfere.'
+))
+
+F = TypeVar('F', bound=Callable[..., Any])
+
+
+def tool(*, read_only: bool = False, destructive: bool = True, idempotent: bool = False) -> Callable[[F], F]:
+    annotations = ToolAnnotations(read_only_hint=read_only, destructive_hint=destructive, idempotent_hint=idempotent, open_world_hint=False)
+
+    def register(function: F) -> F:
+        @functools.wraps(function)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
-                return fn(*args, **kwargs)
-            except _EXPECTED as e:
-                # KeyError's str() wraps the message in quotes; use the raw text.
-                msg = e.args[0] if isinstance(e, KeyError) and e.args else str(e)
-                raise ToolError(str(msg)) from e
+                return function(*args, **kwargs)
+            except (ValueError, RuntimeError, OSError) as error:
+                raise ToolError(str(error)) from None
 
         mcp.tool(annotations=annotations)(wrapper)
-        return fn
+        return function
 
     return register
 
 
-# Destructive: boot() reaps VMs that already exited, deleting their workdir,
-# serial log included. Open world: extra_args can attach anything QEMU can
-# reach, and QEMU's default user-mode NIC gives the guest the network.
-@tool(read_only=False, destructive=True, idempotent=False, open_world=True)
-def qemu_boot(
-    name: str,
-    iso: str | None = None,
-    kernel: str | None = None,
-    append: str | None = None,
-    initrd: str | None = None,
-    disk: str | None = None,
-    arch: str = "x86_64",
-    memory_mb: int = 256,
-    extra_args: str | None = None,
-    machine: str | None = None,
-    smp: int | None = None,
-    accel: str | None = None,
-    cpu: str | None = None,
-    qmp_connect_timeout_s: float = 20.0,
-    qmp_read_timeout_s: float = 15.0,
-) -> str:
-    """Boot a QEMU VM headless and register it under `name`.
+@tool(read_only=True, destructive=False, idempotent=True)
+def qemu_list() -> list[dict[str, Any]]:
+    """List all existing domains, including stopped domains and attachment status."""
+    return controller.list()
 
-    name identifies this VM in all later calls (qemu_screenshot, qemu_stop,
-    etc.) - it must be non-empty and contain no "/" or "\\" (it also names a
-    temp directory and is passed to QEMU's -name flag).
-    Provide at least one of: iso (bootable CD image), kernel (multiboot/bzImage,
-    optionally with append/initrd), or disk (raw or qcow2 disk image, auto-detected;
-    qcow2 is required for qemu_snapshot_save/qemu_snapshot_load). Each of iso,
-    kernel, initrd, and disk, if given, must already exist on disk - qemu_boot
-    checks with a clear FileNotFoundError naming the param and path before any
-    QEMU process starts, rather than letting a typo surface later as an opaque
-    "QEMU exited immediately" failure; qemu_boot never creates a disk image for
-    you, so disk must point at an existing image file. memory_mb must
-    be positive. arch picks the
-    qemu-system-<arch> binary (x86_64, i386, aarch64, riscv64...) and, like
-    name, must contain no "/" or "\\" and not be "." or "..". machine is
-    passed as QEMU's -M and is required on some archs - aarch64 and riscv64
-    have no default machine and need e.g. machine="virt". smp sets the number
-    of virtual CPUs (QEMU -smp), for testing SMP-aware guest code; must be
-    positive when given. accel is passed as QEMU's -accel (e.g. "kvm",
-    "kvm:tcg" to fall back to software emulation if KVM isn't available,
-    "hvf"/"hvf:tcg" on macOS, "whpx:tcg" on Windows) to opt into hardware
-    acceleration; left unset, QEMU defaults to TCG (software emulation),
-    which is correct but slow for anything beyond a trivial kernel. There's
-    no host-capability probe for this - if the requested accelerator isn't
-    available, QEMU itself fails immediately and that failure (including
-    QEMU's own explanation) is surfaced the same way any other immediate
-    boot failure is, in the raised error. cpu is passed as QEMU's -cpu
-    (e.g. "qemu64,+avx", "max", "host" when accel="kvm"/"hvf") to select or
-    customize the emulated CPU model - useful for testing guest code against
-    a specific feature set (SSE4, AVX, a particular vendor's quirks) rather
-    than whatever QEMU defaults to for the arch. extra_args is passed
-    to QEMU verbatim, e.g. "-netdev user,id=n0 -device rtl8139,netdev=n0"
-    (must be valid shell-style quoting, e.g. no unbalanced quotes). extra_args
-    may not contain a flag qemu_boot already sets itself: -name, -m, -display,
-    -qmp always; -M/-machine, -cdrom/-boot, -kernel, -append, -initrd, -smp,
-    -accel, -cpu when the corresponding param above is also given.
-    -drive is exempt from this check even when disk is given - QEMU allows
-    repeated -drive flags, so extra_args can add further disks, e.g.
-    extra_args="-drive file=data.img,format=raw" for a second drive alongside
-    disk (pointing extra_args's -drive at the same file as disk will still
-    fail, but as a QEMU image-locking error at boot, not a pre-flight one).
-    -chardev/-serial are similarly exempt except for the exact chardev
-    qemu_boot's own serial console uses (id=serial0 / chardev:serial0) -
-    extra_args can add an unrelated -chardev or a second -serial (e.g. a
-    COM2 backed by another chardev) freely, but reusing id=serial0 or
-    pointing another -serial at chardev:serial0 is rejected, since that's
-    the pair qemu_serial/qemu_serial_send depend on.
-    qmp_connect_timeout_s bounds how long to retry connecting to QEMU's QMP
-    socket after launch (raise it on a slow/loaded host where QEMU's first
-    launch is slow, e.g. under AV scanning). qmp_read_timeout_s bounds how
-    long any single QMP command (including ones issued by other qemu_* tools
-    for this VM, like qemu_qmp or qemu_snapshot_save) waits for a response -
-    raise it if you expect a command that can legitimately run long. Both
-    timeouts must be positive.
-    The VM keeps running until qemu_stop; serial output is captured continuously.
+
+@tool(destructive=False, idempotent=True)
+def qemu_attach(name: str) -> dict[str, Any]:
+    """Attach an existing domain by name or UUID; retain UUID identity across reconnects."""
+    return controller.attach(name)
+
+
+@tool(idempotent=False)
+def qemu_detach(name: str) -> dict[str, Any]:
+    """Release held input best-effort and detach. Never shut down the guest."""
+    return controller.detach(name)
+
+
+@tool(read_only=True, destructive=False, idempotent=True)
+def qemu_status(name: str) -> dict[str, Any]:
+    """Read the current identity and state of an attached domain."""
+    return controller.status(name)
+
+
+@tool()
+def qemu_start(name: str) -> dict[str, Any]:
+    """Start an attached existing domain and report its actual current state."""
+    return controller.power(name, 'start')
+
+
+@tool()
+def qemu_shutdown(name: str) -> dict[str, Any]:
+    """Request graceful shutdown; report actual state without forced escalation."""
+    return controller.power(name, 'shutdown')
+
+
+@tool()
+def qemu_reboot(name: str) -> dict[str, Any]:
+    """Request graceful reboot; report actual state without forced escalation."""
+    return controller.power(name, 'reboot')
+
+
+@tool()
+def qemu_force_stop(name: str) -> dict[str, Any]:
+    """Immediately destroy the attached running domain. Unsaved guest work may be lost."""
+    return controller.power(name, 'force_stop')
+
+
+@tool(read_only=True, destructive=False, idempotent=True)
+def qemu_screenshot(name: str) -> CallToolResult:
+    """Capture the primary display as full-resolution PNG plus width/height. Never auto-wake."""
+    frame = controller.screenshot(name)
+    dimensions = {'width': frame.width, 'height': frame.height, 'format': 'png'}
+    return CallToolResult(content=[TextContent(type='text', text=json.dumps(dimensions)), Image(data=frame.png, format='png').to_image_content()], structured_content=dimensions)
+
+
+@tool(read_only=True, destructive=False, idempotent=True)
+def qemu_get_resolution(name: str) -> dict[str, int]:
+    """Read primary display dimensions through the same read-only screenshot path."""
+    return controller.resolution(name)
+
+
+@tool(read_only=True, destructive=False, idempotent=True)
+def qemu_wait_screen(name: str, timeout_s: float = 30, poll_interval_s: float = 1, stable_polls: int = 3, max_changed_pixels: int = 64) -> dict[str, Any]:
+    """Wait for bounded framebuffer stability, returning settled/timeout and black status.
+
+    Stability is not readiness. A black display may be asleep; wake only with explicit input.
     """
-    vm = vmmod.boot(
-        name, arch, memory_mb, iso, kernel, append, initrd, disk, extra_args, machine, smp,
-        accel, cpu, qmp_connect_timeout_s, qmp_read_timeout_s,
-    )
-    machine_note = f", -M {machine}" if machine else ""
-    smp_note = f", -smp {smp}" if smp else ""
-    accel_note = f", -accel {accel}" if accel else ""
-    cpu_note = f", -cpu {cpu}" if cpu else ""
-    return (
-        f"VM {name!r} booted (pid {vm.proc.pid}, {arch}, {memory_mb} MB"
-        f"{machine_note}{smp_note}{accel_note}{cpu_note}).\n"
-        f"Serial log: {vm.serial_path}\n"
-        f"Next: qemu_wait_serial for a boot marker, or qemu_screenshot to see the display."
-    )
+    return controller.wait_screen(name, timeout_s, poll_interval_s, stable_polls, max_changed_pixels)
 
 
-@tool(read_only=True, destructive=False, idempotent=True, open_world=False)
-def qemu_screenshot(name: str) -> Image:
-    """Capture the VM's display as a PNG image.
+@tool()
+def qemu_type(name: str, text: str, delay_ms: float = 35) -> dict[str, int | bool]:
+    """Send physical ANSI US keys after whole-text validation; no text is echoed.
 
-    Works headless - the guest's VGA framebuffer is captured via QMP
-    screendump. Use it to see boot screens, kernel panics, GUIs, or a
-    text console that doesn't write to serial. Raises a clear error
-    (instead of an opaque image-decoding failure) if the VM exits while
-    the screendump is in flight.
+    delay_ms (0..1000, default 35) adds inter-character pauses to a 20 ms
+    keyboard-transition floor. characters_sent counts transport-accepted input;
+    guest_text_verified is false. Inspect screenshots for guest text and focus.
     """
-    from PIL import Image as PILImage
-
-    vm = vmmod.get_vm(name)
-    with vmmod.in_use(name):
-        fd, ppm = tempfile.mkstemp(suffix=".ppm", dir=vm.workdir)
-        os.close(fd)
-        try:
-            vm.qmp.command("screendump", filename=ppm)
-            # QMP returns before the file write is guaranteed visible; poll briefly.
-            for _ in range(20):
-                if os.path.getsize(ppm) > 0:
-                    break
-                time.sleep(0.05)
-            else:
-                if not vm.running:
-                    raise RuntimeError(
-                        f"VM {name!r} exited while taking a screenshot "
-                        f"(code {vm.proc.returncode})"
-                    )
-            with PILImage.open(ppm) as im:
-                buf = io.BytesIO()
-                im.save(buf, format="PNG")
-            return Image(data=buf.getvalue(), format="png")
-        finally:
-            # Normally still there - vmmod.in_use above makes qemu_stop wait
-            # for this block to finish before it rmtree's the workdir - but
-            # that wait is best-effort/bounded, so tolerate it already being
-            # gone rather than masking the real result with a FileNotFoundError.
-            try:
-                os.remove(ppm)
-            except OSError:
-                pass
+    return controller.type_text(name, text, delay_ms)
 
 
-# Keystrokes can do anything the guest allows, including deleting its files.
-@tool(read_only=False, destructive=True, idempotent=False, open_world=False)
-def qemu_type(name: str, text: str, delay_ms: int = 35) -> str:
-    """Type text into the guest as keyboard input. "\\n" presses Enter.
+@tool()
+def qemu_key(name: str, combo: str, state: str = 'click') -> dict[str, str]:
+    """Press/release/click paced chords such as ctrl-alt-f1 or rightalt (ralt/alt_r/altgr).
 
-    Handles US-layout characters including shifted symbols. delay_ms is the
-    gap between keystrokes - raise it (e.g. 80) if the guest drops
-    characters during early boot. Must be non-negative.
+    Use rightalt for the right Alt key, not right-alt. Releases run in reverse order.
+    The guest controls IME/layout; input does not verify the resulting guest text.
     """
-    if delay_ms < 0:
-        raise ValueError(f"invalid delay_ms {delay_ms!r}: must be non-negative")
-    vm = vmmod.get_vm(name)
-    # Translate everything first: failing on character 7 after sending 6
-    # would leave a half-typed command in the guest.
-    keystrokes = [keymod.char_to_keys(ch) for ch in text]
-    for qcodes in keystrokes:
-        vm.qmp.command(
-            "send-key",
-            keys=[{"type": "qcode", "data": q} for q in qcodes],
-        )
-        time.sleep(delay_ms / 1000)
-    return f"typed {len(text)} characters into {name!r}"
+    return controller.key(name, combo, state)
 
 
-@tool(read_only=False, destructive=True, idempotent=False, open_world=False)
-def qemu_key(name: str, combo: str) -> str:
-    """Press a key or chord: "enter", "esc", "f12", "ctrl-alt-f2", "ctrl-c"...
+@tool(idempotent=True)
+def qemu_release_all(name: str) -> dict[str, bool]:
+    """Release all keys and buttons held by this MCP attachment."""
+    return controller.release_all(name)
 
-    Parts are joined with "-" and pressed together. A literal "-" key is
-    written "--" (e.g. "ctrl--" for ctrl + minus). Use qemu_type for
-    plain text.
+
+@tool()
+def qemu_mouse_move(name: str, x: float, y: float, coordinate_mode: str = 'pixels') -> dict[str, bool]:
+    """Move in native screenshot pixels, or explicit normalized 0..1 coordinates. No clamping."""
+    return controller.mouse_move(name, x, y, coordinate_mode)
+
+
+@tool()
+def qemu_mouse_click(name: str, button: str = 'left', x: float | None = None, y: float | None = None, state: str = 'click', count: int = 1, coordinate_mode: str = 'pixels') -> dict[str, Any]:
+    """Click/double-click or hold/release left/right/middle. Optional coordinates require x and y.
+
+    count is 1 or 2 for clicks; press/release require count=1. Pixels are the default.
     """
-    vm = vmmod.get_vm(name)
-    qcodes = keymod.parse_combo(combo)
-    vm.qmp.command("send-key", keys=[{"type": "qcode", "data": q} for q in qcodes])
-    return f"pressed {combo} in {name!r}"
+    return controller.mouse_click(name, button, x, y, state, count, coordinate_mode)
 
 
-@tool(read_only=False, destructive=True, idempotent=False, open_world=False)
-def qemu_mouse(name: str, x: float, y: float, button: str | None = None) -> str:
-    """Move the absolute pointer and optionally click.
+@tool()
+def qemu_mouse_scroll(name: str, delta_y: int, delta_x: int = 0) -> dict[str, int]:
+    """Scroll signed integer wheel steps (-100..100 per axis). Positive means down/right."""
+    return controller.mouse_scroll(name, delta_y, delta_x)
 
-    x and y are fractions of the screen width/height (0.0 = left/top, 1.0 =
-    right/bottom) - read them off a qemu_screenshot. button is "left",
-    "right", or "middle" for a full click at that position; omit it to just
-    move the pointer. Needs the guest to have an absolute pointer (USB
-    tablet or PS/2 mouse) to track it - most GUIs have one by default.
+
+@tool()
+def qemu_mouse_drag(name: str, start_x: float, start_y: float, end_x: float, end_y: float, button: str = 'left', duration_ms: float = 500, coordinate_mode: str = 'pixels') -> dict[str, bool]:
+    """Move, press, interpolate and release as one action, with final release on failure.
+
+    Duration is 0..10000 ms; coordinates default to native screenshot pixels.
     """
-    vm = vmmod.get_vm(name)
-    events = mousemod.click_events(x, y, button) if button else mousemod.move_events(x, y)
-    vm.qmp.command("input-send-event", events=events)
-    action = f"clicked {button}" if button else "moved"
-    return f"{action} at ({x:.2f}, {y:.2f}) in {name!r}"
-
-
-def _hmp_result(success_message: str, output: Any) -> str:
-    """Turn a human-monitor-command reply into a tool result.
-
-    QMP's human-monitor-command always returns 200 OK with whatever the HMP
-    command would have printed to the monitor as its return string - it does
-    not raise a QMP error for a failure like "Device does not support
-    snapshots" or "not enough space", so a caller that ignores the return
-    value reports success even when QEMU didn't do anything. savevm/loadvm
-    print nothing on success, so any non-empty output is treated as an
-    error/warning and surfaced instead of the success message.
-    """
-    text = str(output).strip() if output else ""
-    if text:
-        return f"{success_message} may have FAILED - QEMU said: {text}"
-    return success_message
-
-
-# Saving again under an existing tag overwrites that snapshot.
-@tool(read_only=False, destructive=True, idempotent=False, open_world=False)
-def qemu_snapshot_save(name: str, tag: str) -> str:
-    """Save a full VM snapshot (RAM + device state) under `tag`.
-
-    Uses QEMU's internal savevm mechanism, which stores the snapshot inside
-    the disk image itself - the VM's disk must be qcow2 (raw images do not
-    support internal snapshots). Saving again with the same tag overwrites
-    it. tag may only contain letters, digits, '.', '_', '-'.
-    """
-    vm = vmmod.get_vm(name)
-    output = vm.qmp.command(
-        "human-monitor-command", **{"command-line": snapmod.save_command_line(tag)}
-    )
-    return _hmp_result(f"saved snapshot {tag!r} for VM {name!r}", output)
-
-
-# Discards the VM's current state. Loading the same tag twice ends in the
-# same state, so it's idempotent.
-@tool(read_only=False, destructive=True, idempotent=True, open_world=False)
-def qemu_snapshot_load(name: str, tag: str) -> str:
-    """Restore a VM to a snapshot previously saved with qemu_snapshot_save.
-
-    Requires the same qcow2 disk the snapshot was taken on.
-    """
-    vm = vmmod.get_vm(name)
-    output = vm.qmp.command(
-        "human-monitor-command", **{"command-line": snapmod.load_command_line(tag)}
-    )
-    return _hmp_result(f"loaded snapshot {tag!r} for VM {name!r}", output)
-
-
-@tool(read_only=False, destructive=True, idempotent=True, open_world=False)
-def qemu_snapshot_delete(name: str, tag: str) -> str:
-    """Delete a snapshot previously saved with qemu_snapshot_save.
-
-    Frees the space it used inside the qcow2 disk. Reports failure if QEMU's
-    delvm rejects it (e.g. an unknown tag) instead of claiming success.
-    """
-    vm = vmmod.get_vm(name)
-    output = vm.qmp.command(
-        "human-monitor-command", **{"command-line": snapmod.delete_command_line(tag)}
-    )
-    return _hmp_result(f"deleted snapshot {tag!r} for VM {name!r}", output)
-
-
-@tool(read_only=True, destructive=False, idempotent=True, open_world=False)
-def qemu_snapshot_list(name: str) -> str:
-    """List internal snapshots saved on the VM's qcow2 disk.
-
-    Wraps QEMU's HMP `info snapshots` so you can see what tags already exist
-    before calling qemu_snapshot_load or qemu_snapshot_delete, instead of
-    finding out only from a failure afterward. Returns QEMU's raw table
-    output as-is (its exact column layout isn't parsed here).
-    """
-    vm = vmmod.get_vm(name)
-    output = vm.qmp.command(
-        "human-monitor-command", **{"command-line": snapmod.list_command_line()}
-    )
-    text = str(output).strip() if output else ""
-    return text if text else "(no snapshot info returned)"
-
-
-@tool(read_only=True, destructive=False, idempotent=True, open_world=False)
-def qemu_serial(name: str, tail_lines: int = 50) -> str:
-    """Read the tail of the VM's serial console output (COM1).
-
-    Works even after the VM has exited (guest crash, or `quit` via
-    qemu_qmp) so you can see what it printed right before dying - the
-    exited VM stays visible here until qemu_list's next call reaps it.
-    tail_lines must be positive.
-    """
-    if tail_lines <= 0:
-        raise ValueError(f"invalid tail_lines {tail_lines!r}: must be positive")
-    vm = vmmod.get_vm_any(name)
-    note = f"(VM exited, code {vm.proc.returncode})\n" if not vm.running else ""
-    text = vm.serial_text()
-    if not text:
-        return note + "(no serial output yet)"
-    return note + vmmod.tail(text, tail_lines)
-
-
-@tool(read_only=False, destructive=True, idempotent=False, open_world=False)
-def qemu_serial_send(name: str, text: str) -> str:
-    """Write text to the guest's serial console (COM1).
-
-    For guests that only expose a shell over serial (no VGA console, or a
-    kernel with a serial-only debug shell) - the bidirectional counterpart
-    to qemu_serial's read-only tail. Sent exactly as given; include "\\n"
-    yourself for Enter. Kept on one persistent connection for the VM's
-    lifetime - disconnecting and reconnecting would hang up the serial line.
-    If the connection drops (e.g. the guest is mid-reboot) this reconnects
-    once automatically; if that also fails, raises with a message saying so
-    - retry the call once the guest's serial socket is back up.
-    """
-    vm = vmmod.get_vm(name)
-    with vmmod.in_use(name):
-        vm.serial_console.send(text)
-    return f"sent {len(text)} bytes to {name!r}'s serial console"
-
-
-# Doesn't touch the VM, but advances this server's serial mark: the same
-# call made twice waits for a new occurrence, so not idempotent.
-@tool(read_only=True, destructive=False, idempotent=False, open_world=False)
-def qemu_wait_serial(
-    name: str, text: str, timeout_s: int = 30, poll_interval_s: float = 0.25,
-    from_start: bool = False,
-) -> str:
-    """Block until `text` appears on the serial console, or time out.
-
-    The reliable way to know a guest reached a boot stage ("login:",
-    "kernel ready", a shell prompt) before typing or screenshotting.
-    Each wait searches only output after the previous successful wait's
-    match, so waiting for "$ " after typing a command finds the NEW prompt,
-    not the one already on screen. The first wait searches from the start
-    of the log (so a marker printed before the call is still found);
-    from_start=True searches the whole log again.
-    Returns the serial tail either way, prefixed FOUND or TIMEOUT. Always
-    checks at least once, even if timeout_s is 0 or negative.
-    poll_interval_s (default 0.25s) must be positive. Each poll reads only
-    the serial log bytes written since the previous poll, not the whole
-    file, so a long wait against a chatty guest doesn't cost ever-more I/O
-    per poll. text must be non-empty.
-    """
-    if not text:
-        raise ValueError("invalid text '': must be non-empty (an empty needle always matches)")
-    if poll_interval_s <= 0:
-        raise ValueError(
-            f"invalid poll_interval_s {poll_interval_s!r}: must be positive "
-            "(time.sleep rejects a negative value with a raw ValueError, and 0 "
-            "would busy-loop serial reads against the VM)"
-        )
-    vm = vmmod.get_vm(name)
-    with vmmod.in_use(name):
-        deadline = time.monotonic() + timeout_s
-        raw = b""
-        start = 0 if from_start else vm.serial_mark
-        offset = start
-        needle = text.encode("utf-8")
-        while True:
-            new_bytes, offset = vm.serial_bytes_from(offset)
-            raw += new_bytes
-            out = raw.decode("utf-8", errors="replace")
-            hit = raw.find(needle)
-            if hit >= 0:
-                vm.serial_mark = start + hit + len(needle)
-                return "FOUND\n" + vmmod.tail(out, 20)
-            if not vm.running:
-                return "VM EXITED\n" + vmmod.tail(out, 20)
-            if time.monotonic() >= deadline:
-                return "TIMEOUT\n" + vmmod.tail(out, 20)
-            time.sleep(poll_interval_s)
-
-
-@tool(read_only=True, destructive=False, idempotent=True, open_world=False)
-def qemu_wait_screen(
-    name: str, timeout_s: int = 30, poll_interval_s: float = 1.0, stable_polls: int = 3,
-    max_changed_pixels: int = 64,
-) -> str:
-    """Block until the VM's display stops changing, or time out.
-
-    Polls screendumps every poll_interval_s and waits for `stable_polls`
-    consecutive frames that each differ from the previous one by at most
-    max_changed_pixels pixels (default 64: a blinking text-mode cursor flips
-    about 18, so identical frames never happen on a text console, while boot
-    output changes hundreds; use 0 to require identical frames) - the
-    reliable way to know a VGA-only
-    guest (no serial output) has finished a BIOS splash or boot animation
-    before you screenshot or type. For guests with serial output, prefer
-    qemu_wait_serial - it doesn't need a fixed number of polls to decide.
-    Always polls at least once, even if timeout_s is 0 or negative.
-    poll_interval_s must be positive.
-    """
-    if poll_interval_s <= 0:
-        raise ValueError(
-            f"invalid poll_interval_s {poll_interval_s!r}: must be positive "
-            "(time.sleep rejects a negative value with a raw ValueError, and 0 "
-            "would busy-loop screendump calls against the VM)"
-        )
-    tracker = screenmod.StabilityTracker(stable_polls, max_changed_pixels)
-    vm = vmmod.get_vm(name)
-    with vmmod.in_use(name):
-        fd, ppm = tempfile.mkstemp(suffix=".ppm", dir=vm.workdir)
-        os.close(fd)
-        try:
-            deadline = time.monotonic() + timeout_s
-            polls = 0
-            while True:
-                vm.qmp.command("screendump", filename=ppm)
-                for _ in range(20):
-                    if os.path.getsize(ppm) > 0:
-                        break
-                    time.sleep(0.05)
-                polls += 1
-                if not vm.running:
-                    return f"VM EXITED after {polls} polls"
-                if tracker.update(screenmod.load_frame(ppm)):
-                    return (f"SETTLED after {polls} polls ({stable_polls} frames in a row with "
-                            f"<= {max_changed_pixels} changed pixels; last change: "
-                            f"{tracker.last_changed} px)")
-                if time.monotonic() >= deadline:
-                    return (f"TIMEOUT after {timeout_s}s ({polls} polls; last change: "
-                            f"{tracker.last_changed} px, threshold {max_changed_pixels})")
-                time.sleep(poll_interval_s)
-        finally:
-            # See qemu_screenshot's matching comment: vmmod.in_use makes
-            # qemu_stop wait for this loop to exit before rmtree'ing the
-            # workdir, but that wait is best-effort/bounded.
-            try:
-                os.remove(ppm)
-            except OSError:
-                pass
-
-
-@tool(read_only=True, destructive=False, idempotent=True, open_world=False)
-def qemu_version(arch: str = "x86_64") -> str:
-    """Report `qemu-system-<arch> --version`'s own output, without booting a VM.
-
-    Useful when a QMP command or machine type behaves unexpectedly and you
-    need to know what's actually installed - arch picks the same
-    qemu-system-<arch> binary qemu_boot would use.
-    """
-    return vmmod.version(arch)
-
-
-# Not read-only: it reaps VMs that exited on their own, deleting their
-# workdir and serial log (see qemu_serial).
-@tool(read_only=False, destructive=True, idempotent=True, open_world=False)
-def qemu_list() -> str:
-    """List all VMs managed by this server, with arch, machine, pid, uptime, and state.
-
-    A VM that exited on its own (guest panic, or `quit` via qemu_qmp) is
-    shown here once as exited(...), then reaped - its workdir and handles
-    are freed before this call returns, so it won't reappear next time.
-    """
-    vms = vmmod.list_vms()
-    if not vms:
-        return "no VMs"
-    rows = []
-    for vm in vms:
-        state = "running" if vm.running else f"exited({vm.proc.returncode})"
-        machine_note = f" -M {vm.machine}" if vm.machine else ""
-        rows.append(
-            f"{vm.name}: {state}, {vm.arch}{machine_note}, pid {vm.proc.pid}, "
-            f"up {int(time.monotonic() - vm.started_at)}s, "
-            f"serial {os.path.getsize(vm.serial_path) if os.path.isfile(vm.serial_path) else 0} bytes"
-        )
-    vmmod.reap_dead()
-    return "\n".join(rows)
-
-
-# Idempotent in MCP's sense: a second stop changes nothing (it errors).
-@tool(read_only=False, destructive=True, idempotent=True, open_world=False)
-def qemu_stop(
-    name: str,
-    force: bool = False,
-    graceful_timeout_s: float = 10.0,
-    kill_timeout_s: float = 3.0,
-) -> str:
-    """Stop a VM. Tries graceful ACPI powerdown first; force=True kills it.
-
-    Guests without ACPI handling (most hobby kernels) will need force=True
-    or will be killed after the graceful_timeout_s grace period anyway.
-    graceful_timeout_s (default 10 s) bounds how long to wait for the guest
-    to shut down after ACPI powerdown before falling back to a kill; raise
-    it for a guest that legitimately needs longer (large RAM, a slow ACPI
-    handler). kill_timeout_s (default 3 s) bounds how long to wait for the
-    QEMU process to exit after `quit`/kill before it's force-killed. Both
-    must be positive.
-    """
-    outcome = vmmod.stop(name, force, graceful_timeout_s, kill_timeout_s)
-    return f"VM {name!r} stopped ({outcome})"
-
-
-# Raw QMP can do anything QEMU can, including reaching other hosts.
-@tool(read_only=False, destructive=True, idempotent=False, open_world=True)
-def qemu_qmp(name: str, command: str, arguments: dict[str, Any] | None = None) -> str:
-    """Escape hatch: run a raw QMP command on the VM.
-
-    Examples: query-status, system_reset, memsave, device_add. See the QEMU
-    QMP reference for commands and their arguments.
-    """
-    vm = vmmod.get_vm(name)
-    with vmmod.in_use(name):
-        result = vm.qmp.command(command, **(arguments or {}))
-    return json.dumps(result, indent=2, default=str)
+    return controller.mouse_drag(name, start_x, start_y, end_x, end_y, button, duration_ms, coordinate_mode)
 
 
 def main() -> None:
     mcp.run()
-
-
-if __name__ == "__main__":
-    main()

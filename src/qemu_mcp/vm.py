@@ -1,621 +1,240 @@
-"""VM lifecycle: find QEMU, launch it with QMP + file-backed serial, track it."""
-
+"""UUID attachments and serialized whole actions on existing libvirt domains."""
 from __future__ import annotations
 
-import os
-import shlex
-import shutil
-import socket
-import subprocess
-import sys
-import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Any, Iterator
 
-from .qmp import QMPClient, QMPError
-from .serial import SerialConsole, chardev_args
-
-_WINDOWS_QEMU_DIRS = [
-    r"C:\Program Files\qemu",
-    r"C:\Program Files (x86)\qemu",
-]
-
-
-def _windows_search_dirs() -> list[str]:
-    r"""QEMU_DIR/_WINDOWS_QEMU_DIRS, plus one level of their subdirectories.
-
-    Covers both a flat install (`...\qemu\qemu-system-x86_64.exe`) and one
-    nested a version folder deeper (`...\qemu\qemu-8.2.0\qemu-system-x86_64.exe`),
-    which some non-installer QEMU-for-Windows distributions (and manual
-    extracts) use instead of a flat layout.
-    """
-    bases = [d for d in [os.environ.get("QEMU_DIR"), *_WINDOWS_QEMU_DIRS] if d]
-    dirs = list(bases)
-    for base in bases:
-        try:
-            entries = os.listdir(base)
-        except OSError:
-            continue
-        for entry in entries:
-            sub = os.path.join(base, entry)
-            if os.path.isdir(sub):
-                dirs.append(sub)
-    return dirs
-
-
-def _installed_arches() -> list[str]:
-    """Scan PATH (and the Windows QEMU dirs) for other qemu-system-* binaries."""
-    dirs = os.environ.get("PATH", "").split(os.pathsep)
-    if sys.platform == "win32":
-        dirs = [*_windows_search_dirs(), *dirs]
-    found = set()
-    for directory in dirs:
-        if not directory:
-            continue
-        try:
-            entries = os.listdir(directory)
-        except OSError:
-            continue
-        for entry in entries:
-            name = entry[:-4] if sys.platform == "win32" and entry.lower().endswith(".exe") else entry
-            if name.startswith("qemu-system-"):
-                found.add(name[len("qemu-system-"):])
-    return sorted(found)
-
-
-def find_qemu(arch: str) -> str:
-    if not arch or "/" in arch or "\\" in arch or arch in (".", ".."):
-        raise ValueError(
-            f"invalid arch {arch!r}: must be non-empty with no path separators "
-            "(it's built into the qemu-system-<arch> binary name looked up on PATH)"
-        )
-    exe = f"qemu-system-{arch}"
-    path = shutil.which(exe)
-    if path:
-        return path
-    if sys.platform == "win32":
-        for base in _windows_search_dirs():
-            if os.path.isfile(os.path.join(base, exe + ".exe")):
-                return os.path.join(base, exe + ".exe")
-    found = _installed_arches()
-    hint = (
-        f" Found on this system: {', '.join(found)}."
-        if found
-        else " No qemu-system-* binaries found anywhere on this system."
-    )
-    raise FileNotFoundError(
-        f"{exe} not found. Install QEMU and put it on PATH "
-        f"(or set QEMU_DIR on Windows).{hint}"
-    )
-
-
-def version(arch: str) -> str:
-    """Run `qemu-system-<arch> --version` and return its output, without booting a VM.
-
-    Lets a caller check what's actually installed (version, and therefore
-    which QMP commands/machine types it supports) before committing to a
-    qemu_boot call.
-    """
-    qemu = find_qemu(arch)
-    try:
-        result = subprocess.run(
-            [qemu, "--version"], capture_output=True, text=True, timeout=10, check=False
-        )
-    except subprocess.SubprocessError as e:
-        raise RuntimeError(f"running '{qemu} --version' failed: {e}") from e
-    return (result.stdout or result.stderr).strip()
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port: int = s.getsockname()[1]
-        return port
-
-
-_MAX_PORT_CONFLICT_RETRIES = 3
-
-# How long stop() waits for in-flight pollers (see _in_use below) to notice
-# the VM has stopped and release it, before closing handles/removing the
-# workdir anyway.
-_STOP_IN_USE_WAIT_S = 5.0
-_STOP_IN_USE_POLL_S = 0.05
-
-_QCOW2_MAGIC = b"QFI\xfb"
-
-# Flags vm.boot() always sets on the QEMU command line, plus the ones it
-# only sets when the corresponding qemu_boot param is given. -M/-machine
-# are QEMU synonyms for the same flag, so both are guarded together.
-# -drive is deliberately NOT here even though `disk` sets one: unlike -m/-M/
-# etc., QEMU natively supports repeated -drive flags for unrelated disks
-# (e.g. a second data disk alongside the boot disk from `disk`), so a blanket
-# token-membership ban blocked a legitimate, common use case instead of an
-# actual collision. A second -drive pointed at the *same* file `disk` uses
-# would still fail, but as a QEMU image-locking error at boot, surfaced
-# through the existing "QEMU exited immediately" path rather than pre-flight.
-# -chardev/-serial are also NOT here for the same reason: QEMU allows
-# repeated -chardev/-serial for unrelated devices (a second COM port, a
-# chardev backing something else) - only a token that reuses vm.boot()'s own
-# id=serial0 chardev or its chardev:serial0 serial backend actually collides
-# with the load-bearing pair qemu_serial/qemu_serial_send depend on. See
-# _extra_args_serial_conflict below for that keyed comparison.
-_ALWAYS_SET_FLAGS = frozenset({"-name", "-m", "-display", "-qmp"})
-_CONDITIONAL_FLAGS: dict[str, frozenset[str]] = {
-    "machine": frozenset({"-M", "-machine"}),
-    "iso": frozenset({"-cdrom", "-boot"}),
-    "kernel": frozenset({"-kernel"}),
-    "append": frozenset({"-append"}),
-    "initrd": frozenset({"-initrd"}),
-    "smp": frozenset({"-smp"}),
-    "accel": frozenset({"-accel"}),
-    "cpu": frozenset({"-cpu"}),
-}
-
-_SERIAL_CHARDEV_ID = "serial0"
-_SERIAL_BACKEND = f"chardev:{_SERIAL_CHARDEV_ID}"
-
-
-def _extra_args_serial_conflict(extra_argv: list[str]) -> str | None:
-    """Return the -chardev/-serial token pair that collides with vm.boot()'s
-    own serial chardev (id=serial0), or None if extra_argv adds none.
-
-    Unlike -m/-M/etc., a bare "-chardev" or "-serial" in extra_argv isn't
-    itself a collision - only one that names the exact id/backend vm.boot()
-    already uses is: a second -chardev with an unrelated id=, or a second
-    -serial pointed at a different backend (another chardev, a COM port,
-    /dev/null, ...), is a legitimate additional device, not a duplicate.
-    """
-    for flag, value in zip(extra_argv, extra_argv[1:]):
-        if flag == "-chardev" and f"id={_SERIAL_CHARDEV_ID}" in value.split(","):
-            return f"-chardev {value}"
-        if flag == "-serial" and value == _SERIAL_BACKEND:
-            return f"-serial {value}"
-    return None
-
-
-def _check_extra_args_conflicts(
-    extra_argv: list[str],
-    *,
-    machine: str | None,
-    iso: str | None,
-    kernel: str | None,
-    append: str | None,
-    initrd: str | None,
-    disk: str | None,
-    smp: int | None,
-    accel: str | None,
-    cpu: str | None,
-) -> None:
-    """Reject an extra_args token that duplicates a flag vm.boot() already sets.
-
-    QEMU's behavior on a duplicate flag varies (silently takes the last
-    value, hard-errors, or combines in a surprising way), so this raises a
-    clear ValueError before ever launching QEMU instead of letting a
-    collision surface as a confusing boot failure.
-    """
-    controlled = set(_ALWAYS_SET_FLAGS)
-    given = {
-        "machine": machine, "iso": iso, "kernel": kernel, "append": append,
-        "initrd": initrd, "disk": disk, "smp": smp, "accel": accel, "cpu": cpu,
-    }
-    for param, flags in _CONDITIONAL_FLAGS.items():
-        if given[param]:
-            controlled |= flags
-    conflicts: list[str] = sorted(controlled & set(extra_argv))
-    serial_conflict = _extra_args_serial_conflict(extra_argv)
-    if serial_conflict is not None:
-        conflicts.append(serial_conflict)
-    if conflicts:
-        raise ValueError(
-            f"extra_args contains {conflicts!r}, which qemu-mcp already sets on the "
-            "command line based on other qemu_boot parameters - remove it from "
-            "extra_args, or unset the corresponding parameter"
-        )
-
-
-def disk_format(path: str) -> str:
-    """"qcow2" if `path` starts with the qcow2 magic, else "raw".
-
-    Snapshot save/load (savevm/loadvm) only works on qcow2 - if this always
-    said "raw", qemu_boot would silently force every disk into raw mode and
-    qemu_snapshot_save would fail on every qcow2 image passed to it.
-    """
-    try:
-        with open(path, "rb") as f:
-            magic = f.read(len(_QCOW2_MAGIC))
-    except OSError:
-        return "raw"
-    return "qcow2" if magic == _QCOW2_MAGIC else "raw"
+from . import keys, mouse
+from .backend import LibvirtBackend, Screenshot
+from .control import CLICK_GAP_S, KEY_EVENT_INTERVAL_MS, KEY_HOLD_S, InputState, bounded_number, integer
+from .screen import StabilityTracker
 
 
 @dataclass
-class VM:
-    name: str
-    proc: subprocess.Popen[bytes]
-    qmp: QMPClient
-    workdir: str
-    serial_path: str
-    serial_console: SerialConsole
-    qemu_log: str
-    cmdline: list[str]
-    arch: str
-    machine: str | None = None
-    started_at: float = field(default_factory=time.monotonic)
-    # Serial-log byte offset just past the last qemu_wait_serial match, so
-    # the next wait only sees new output (e.g. the prompt after a command).
-    serial_mark: int = 0
-
-    @property
-    def running(self) -> bool:
-        return self.proc.poll() is None
-
-    def serial_text(self) -> str:
-        try:
-            with open(self.serial_path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
-        except OSError:
-            return ""
-
-    def serial_bytes_from(self, offset: int) -> tuple[bytes, int]:
-        """Read serial.log bytes written at or after `offset`.
-
-        For a poll loop that calls this repeatedly with the offset it last
-        returned: only the bytes appended since the previous call are read
-        off disk, instead of re-reading the whole (ever-growing) file on
-        every poll. Returns (new_bytes, new_offset); new_offset == offset
-        if nothing new was available (including when the file doesn't exist
-        yet).
-        """
-        try:
-            with open(self.serial_path, "rb") as f:
-                f.seek(offset)
-                data = f.read()
-            return data, offset + len(data)
-        except OSError:
-            return b"", offset
+class Attachment:
+    uuid: str
+    inputs: InputState
+    lock: Any = field(default_factory=threading.RLock)
+    active: bool = True
 
 
-_vms: dict[str, VM] = {}
-# Sync tool functions (qemu_boot, qemu_stop, ...) each run on their own worker
-# thread (the mcp SDK dispatches concurrent tool calls via anyio.to_thread.run_sync,
-# and only `initialize` is handled inline on the read loop), so two of them can
-# be inside boot()/stop() for the same VM name at once. Guards every read and
-# write of _vms/_booting below; reap_dead() always acquires and releases it on
-# its own rather than being called while a caller already holds it.
-_vms_lock = threading.Lock()
-# Names with a boot() call in flight (reserved before the slow Popen/QMP work
-# starts, released when that call returns or raises) - closes the window where
-# two concurrent boot() calls for the same name would both pass the "not
-# already running" check and then race to overwrite _vms[name], leaking
-# whichever QEMU process lost.
-_booting: set[str] = set()
-# Per-name count of in-flight long-running callers (qemu_wait_serial,
-# qemu_wait_screen, qemu_screenshot, qemu_qmp, qemu_serial_send) currently
-# using a VM's qmp/serial_console/workdir. stop() and reap_dead() each wait
-# (briefly, via _wait_until_not_in_use) for this to drop to zero before
-# closing those handles and removing the workdir, so a caller racing a
-# concurrent qemu_stop or a VM that exited on its own sees a clean
-# "VM EXITED"/timeout/QMPError result instead of a missing-file surprise
-# from a handle that was closed out from under it.
-_in_use: dict[str, int] = {}
+class Controller:
+    def __init__(self, backend: LibvirtBackend):
+        self.backend = backend
+        self._attachments: dict[str, Attachment] = {}
+        self._aliases: dict[str, str] = {}
+        self._lock = threading.RLock()
 
+    def list(self) -> list[dict[str, Any]]:
+        result = []
+        for domain in self.backend.domains():
+            info = self.backend.identity(domain)
+            with self._lock:
+                info['attached'] = info['uuid'] in self._attachments
+            result.append(info)
+        return result
 
-def _wait_until_not_in_use(name: str) -> None:
-    """Best-effort/bounded wait for a name's _in_use count to hit zero.
+    def attach(self, name: str) -> dict[str, Any]:
+        domain = self.backend.resolve(name)
+        info = self.backend.identity(domain)
+        uuid = str(info['uuid'])
+        with self._lock:
+            if uuid not in self._attachments:
+                self._attachments[uuid] = Attachment(uuid, InputState(self.backend))
+            self._aliases[name] = uuid
+            self._aliases[str(info['name'])] = uuid
+            self._aliases[uuid] = uuid
+        return {**info, 'attached': True}
 
-    Shared by stop() and reap_dead(): both close a VM's qmp/serial_console
-    and remove its workdir, and both want to give an in-flight
-    qemu_wait_serial/qemu_wait_screen/qemu_screenshot/qemu_qmp/
-    qemu_serial_send caller a chance to notice the VM is gone on its own
-    next poll/call first, rather than racing its handles out from under it.
-    Not a guarantee - a caller parked on a poll_interval_s longer than
-    _STOP_IN_USE_WAIT_S can still lose the race - but it narrows the window
-    the same way in both places instead of only in one.
-    """
-    deadline = time.monotonic() + _STOP_IN_USE_WAIT_S
-    while True:
-        with _vms_lock:
-            busy = _in_use.get(name, 0) > 0
-        if not busy or time.monotonic() >= deadline:
-            return
-        time.sleep(_STOP_IN_USE_POLL_S)
-
-
-@contextmanager
-def in_use(name: str) -> Iterator[None]:
-    """Mark a VM as having an in-flight caller, for the duration of `with`."""
-    with _vms_lock:
-        _in_use[name] = _in_use.get(name, 0) + 1
-    try:
-        yield
-    finally:
-        with _vms_lock:
-            count = _in_use.get(name, 0) - 1
-            if count <= 0:
-                _in_use.pop(name, None)
-            else:
-                _in_use[name] = count
-
-
-def _lookup(name: str) -> VM:
-    with _vms_lock:
-        vm = _vms.get(name)
-        if vm is None:
-            known = ", ".join(_vms) or "none"
-            raise KeyError(f"no VM named {name!r} (running VMs: {known})")
-        return vm
-
-
-def get_vm(name: str) -> VM:
-    vm = _lookup(name)
-    if not vm.running:
-        raise RuntimeError(
-            f"VM {name!r} has exited (code {vm.proc.returncode}). "
-            f"Last serial output:\n{tail(vm.serial_text(), 15)}"
-        )
-    return vm
-
-
-def get_vm_any(name: str) -> VM:
-    """Like get_vm, but returns an exited VM instead of raising.
-
-    For read-only introspection that doesn't need a live QMP connection -
-    qemu_serial reads a log file off disk, so it works just as well after
-    the VM has died, and that's often exactly when it's needed most (to
-    see what the guest printed right before a crash).
-    """
-    return _lookup(name)
-
-
-def list_vms() -> list[VM]:
-    with _vms_lock:
-        return list(_vms.values())
-
-
-def reap_dead() -> list[str]:
-    """Drop exited VMs from the registry and free their resources.
-
-    A VM that exits on its own (guest panic, or `quit` sent via the
-    qemu_qmp escape hatch) has no `qemu_stop` call to trigger cleanup, so
-    without this its qmp/serial_console handles and workdir leak until
-    someone notices and stops it explicitly. Called opportunistically from
-    boot() and qemu_list so dead entries get cleaned up on their own.
-
-    Waits (briefly, best-effort/bounded - same as stop()) for each dead
-    name's _in_use count to clear before closing its handles, so a
-    qemu_qmp/qemu_serial_send/poll-loop caller that's still mid-flight
-    against a VM that just exited on its own gets a clean error from its
-    own next read/write instead of a raw AttributeError from a handle
-    closed out from under it.
-    """
-    with _vms_lock:
-        dead = [name for name, vm in _vms.items() if not vm.running]
-        stale_vms = [(name, _vms.pop(name)) for name in dead]
-    for name, stale in stale_vms:
-        _wait_until_not_in_use(name)
-        stale.qmp.close()
-        stale.serial_console.close()
-        shutil.rmtree(stale.workdir, ignore_errors=True)
-    return dead
-
-
-def tail(text: str, lines: int) -> str:
-    return "\n".join(text.splitlines()[-lines:])
-
-
-def boot(
-    name: str,
-    arch: str,
-    memory_mb: int,
-    iso: str | None,
-    kernel: str | None,
-    append: str | None,
-    initrd: str | None,
-    disk: str | None,
-    extra_args: str | None,
-    machine: str | None = None,
-    smp: int | None = None,
-    accel: str | None = None,
-    cpu: str | None = None,
-    qmp_connect_timeout_s: float = 20.0,
-    qmp_read_timeout_s: float = 15.0,
-) -> VM:
-    if not name or "/" in name or "\\" in name or name in (".", ".."):
-        raise ValueError(
-            f"invalid VM name {name!r}: must be non-empty with no path separators "
-            "(it names a temp directory and the QEMU -name flag)"
-        )
-    if memory_mb <= 0:
-        raise ValueError(
-            f"invalid memory_mb {memory_mb!r}: must be a positive number of megabytes"
-        )
-    if smp is not None and smp <= 0:
-        raise ValueError(f"invalid smp {smp!r}: must be a positive number of CPUs")
-    if qmp_connect_timeout_s <= 0:
-        raise ValueError(
-            f"invalid qmp_connect_timeout_s {qmp_connect_timeout_s!r}: must be positive"
-        )
-    if qmp_read_timeout_s <= 0:
-        raise ValueError(
-            f"invalid qmp_read_timeout_s {qmp_read_timeout_s!r}: must be positive "
-            "(socket.settimeout rejects non-positive values with a raw ValueError, "
-            "which would otherwise escape uncaught after QEMU is already running)"
-        )
-    extra_argv: list[str] = []
-    if extra_args:
-        try:
-            extra_argv = shlex.split(extra_args, posix=(os.name != "nt"))
-        except ValueError as e:
-            raise ValueError(f"invalid extra_args {extra_args!r}: {e}") from None
-    _check_extra_args_conflicts(
-        extra_argv, machine=machine, iso=iso, kernel=kernel, append=append,
-        initrd=initrd, disk=disk, smp=smp, accel=accel, cpu=cpu,
-    )
-
-    reap_dead()
-    with _vms_lock:
-        stale = _vms.get(name)
-        if stale is not None and stale.running:
-            raise RuntimeError(f"a VM named {name!r} is already running - stop it first")
-        if name in _booting:
-            raise RuntimeError(
-                f"a VM named {name!r} is already being booted by a concurrent call"
-            )
-        _booting.add(name)
-
-    try:
-        if not (iso or kernel or disk):
-            raise ValueError("nothing to boot: give at least one of iso, kernel, disk")
-        for label, p in (("iso", iso), ("kernel", kernel), ("initrd", initrd), ("disk", disk)):
-            if p and not os.path.isfile(p):
-                raise FileNotFoundError(f"{label} not found: {p}")
-
-        qemu = find_qemu(arch)
-
-        last_error: RuntimeError | None = None
-        for _attempt in range(_MAX_PORT_CONFLICT_RETRIES):
-            port = _free_port()
-            serial_port = _free_port()
-            workdir = tempfile.mkdtemp(prefix=f"qemu-mcp-{name}-")
-            serial_path = os.path.join(workdir, "serial.log")
-            qemu_log = os.path.join(workdir, "qemu.log")
-
-            args = [
-                qemu,
-                "-name", name,
-                "-m", str(memory_mb),
-                "-display", "none",
-                "-qmp", f"tcp:127.0.0.1:{port},server,nowait",
-                *chardev_args(serial_path, serial_port),
-            ]
-            if machine:
-                args += ["-M", machine]
-            if smp:
-                args += ["-smp", str(smp)]
-            if accel:
-                args += ["-accel", accel]
-            if cpu:
-                args += ["-cpu", cpu]
-            if iso:
-                args += ["-cdrom", iso, "-boot", "d"]
-            if kernel:
-                args += ["-kernel", kernel]
-            if append:
-                args += ["-append", append]
-            if initrd:
-                args += ["-initrd", initrd]
-            if disk:
-                args += ["-drive", f"file={disk},format={disk_format(disk)}"]
-            args += extra_argv
-
-            with open(qemu_log, "w", encoding="utf-8") as log:
-                proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-            # subprocess.Popen dup2's the fd into the child before returning, so the
-            # child keeps writing to qemu_log after this parent-side handle closes -
-            # closing here (instead of leaving it open for the VM's whole lifetime,
-            # unclosed even by vm.stop()) avoids leaking one fd per successful boot.
-
+    @contextmanager
+    def _action(self, name: str, *, cleanup: bool = False) -> Iterator[tuple[Attachment, Any]]:
+        with self._lock:
+            attached = self._attachments.get(self._aliases.get(name, name))
+        if attached is None:
+            raise ValueError('Domain is not attached. Call qemu_attach with its name or UUID first.')
+        with attached.lock:
+            if not attached.active:
+                raise ValueError('Domain is detached. Call qemu_attach first.')
+            domain = self.backend.resolve(attached.uuid, uuid_only=True)
             try:
-                qmp = QMPClient(port, connect_timeout=qmp_connect_timeout_s, read_timeout=qmp_read_timeout_s)
-            except QMPError:
-                if proc.poll() is not None:
-                    with open(qemu_log, encoding="utf-8", errors="replace") as f:
-                        detail = f.read().strip()
-                    shutil.rmtree(workdir, ignore_errors=True)
-                    last_error = RuntimeError(
-                        f"QEMU exited immediately (code {proc.returncode}):\n{detail}"
-                    )
-                    if "address already in use" in detail.lower():
-                        # _free_port() binds an ephemeral socket only to immediately
-                        # close it and hand the now-freed port number to QEMU - between
-                        # that close() and QEMU's own bind(), something else (another
-                        # concurrent qemu_boot, or an unrelated process) can grab the
-                        # same port first. Retry with a fresh pair of ports instead of
-                        # surfacing what looks like a random, non-reproducible failure.
-                        continue
-                    raise last_error from None
-                proc.kill()
-                proc.wait()
-                shutil.rmtree(workdir, ignore_errors=True)
+                yield attached, domain
+            except RuntimeError:
+                if cleanup:
+                    try:
+                        attached.inputs.release_all(domain)
+                    except RuntimeError:
+                        pass
                 raise
-            else:
-                vm = VM(
-                    name=name, proc=proc, qmp=qmp, workdir=workdir,
-                    serial_path=serial_path, serial_console=SerialConsole(serial_port),
-                    qemu_log=qemu_log, cmdline=args, arch=arch, machine=machine,
-                )
-                with _vms_lock:
-                    _vms[name] = vm
-                return vm
 
-        assert last_error is not None
-        raise last_error
-    finally:
-        with _vms_lock:
-            _booting.discard(name)
+    def status(self, name: str) -> dict[str, Any]:
+        with self._action(name) as (_, domain):
+            return {**self.backend.identity(domain), 'attached': True}
 
-
-def stop(
-    name: str,
-    force: bool,
-    graceful_timeout_s: float = 10.0,
-    kill_timeout_s: float = 3.0,
-) -> str:
-    if graceful_timeout_s <= 0:
-        raise ValueError(
-            f"invalid graceful_timeout_s {graceful_timeout_s!r}: must be positive"
-        )
-    if kill_timeout_s <= 0:
-        raise ValueError(f"invalid kill_timeout_s {kill_timeout_s!r}: must be positive")
-    with _vms_lock:
-        vm = _vms.get(name)
-        if vm is None:
-            raise KeyError(f"no VM named {name!r}")
-    outcome = "already exited"
-    if vm.running:
-        if not force:
+    def detach(self, name: str) -> dict[str, Any]:
+        with self._lock:
+            attached = self._attachments.get(self._aliases.get(name, name))
+        if attached is None:
+            raise ValueError('Domain is not attached. Call qemu_attach first.')
+        with attached.lock:
+            released = True
             try:
-                vm.qmp.command("system_powerdown")
-                outcome = "ACPI powerdown"
-            except QMPError:
-                force = True
-            else:
-                # Only wait for a graceful shutdown if the powerdown request
-                # actually reached the guest - if the QMP command itself
-                # failed, the guest was never asked to shut down, so waiting
-                # here just burns the full grace period before falling back
-                # to a kill.
-                poll_interval_s = 0.25
-                polls = max(1, int(graceful_timeout_s / poll_interval_s))
-                for _ in range(polls):
-                    if not vm.running:
-                        break
-                    time.sleep(poll_interval_s)
-        if vm.running:
+                domain = self.backend.resolve(attached.uuid, uuid_only=True)
+                attached.inputs.release_all(domain)
+            except RuntimeError:
+                released = False
+            with self._lock:
+                attached.active = False
+                self._attachments.pop(attached.uuid, None)
+                self._aliases = {alias: uuid for alias, uuid in self._aliases.items() if uuid != attached.uuid}
+            return {'uuid': attached.uuid, 'attached': False, 'inputs_released': released}
+
+    def close(self) -> None:
+        with self._lock:
+            uuids = list(self._attachments)
+        for uuid in uuids:
             try:
-                vm.qmp.command("quit")
-            except QMPError:
+                self.detach(uuid)
+            except (RuntimeError, ValueError):
                 pass
+        self.backend.close()
+
+    def power(self, name: str, action: str) -> dict[str, Any]:
+        with self._action(name) as (_, domain):
+            self.backend.power(domain, action)
+            return {**self.backend.identity(domain), 'requested': action, 'attached': True}
+
+    def screenshot(self, name: str) -> Screenshot:
+        with self._action(name) as (_, domain):
+            return self.backend.capture(domain)
+
+    def resolution(self, name: str) -> dict[str, int]:
+        frame = self.screenshot(name)
+        return {'width': frame.width, 'height': frame.height}
+
+    def wait_screen(self, name: str, timeout_s: float = 30, poll_interval_s: float = 1, stable_polls: int = 3, max_changed_pixels: int = 64) -> dict[str, Any]:
+        bounded_number(timeout_s, 'timeout_s', 0.01, 300)
+        bounded_number(poll_interval_s, 'poll_interval_s', 0.01, 300)
+        integer(stable_polls, 'stable_polls', 1, 1000)
+        integer(max_changed_pixels, 'max_changed_pixels', 0, 100000000)
+        tracker = StabilityTracker(stable_polls, max_changed_pixels)
+        deadline = time.monotonic() + timeout_s
+        polls = 0
+        while True:
+            frame = self.screenshot(name)
+            image = frame.image()
+            polls += 1
+            settled = tracker.update(image)
+            black = image.getbbox() is None
+            result = {'status': 'settled' if settled else 'timeout', 'settled': settled, 'black': black, 'readiness': 'unknown', 'width': frame.width, 'height': frame.height, 'polls': polls, 'changed_pixels': tracker.last_changed}
+            if settled:
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return result
+            time.sleep(min(poll_interval_s, remaining))
+
+    def type_text(self, name: str, text: str, delay_ms: float = 35) -> dict[str, int | bool]:
+        bounded_number(delay_ms, 'delay_ms', 0, 1000)
+        try:
+            chords = [keys.char_to_keys(character) for character in text]
+        except ValueError:
+            raise ValueError('Text contains unsupported characters. Only physical ANSI US key positions are supported; the guest controls layout and IME.') from None
+        with self._action(name, cleanup=True) as (attached, domain):
+            for index, chord in enumerate(chords):
+                attached.inputs.chord(domain, chord, 'click')
+                if index + 1 < len(chords):
+                    time.sleep(delay_ms / 1000)
+        return {'characters_sent': len(text), 'guest_text_verified': False, 'key_event_interval_ms': KEY_EVENT_INTERVAL_MS}
+
+    def key(self, name: str, combo: str, state: str = 'click') -> dict[str, str]:
+        self._validate_state(state)
+        try:
+            codes = list(dict.fromkeys(keys.parse_combo(combo)))
+        except ValueError:
+            raise ValueError('Invalid key combo. Use ctrl-alt-f1, rightalt, enter, arrows or ANSI US keys.') from None
+        with self._action(name, cleanup=True) as (attached, domain):
+            attached.inputs.chord(domain, codes, state)
+        return {'state': state}
+
+    @staticmethod
+    def _validate_state(state: str) -> None:
+        if state not in ('click', 'press', 'release'):
+            raise ValueError('state must be click, press or release')
+
+    def release_all(self, name: str) -> dict[str, bool]:
+        with self._action(name) as (attached, domain):
+            attached.inputs.release_all(domain)
+        return {'inputs_released': True}
+
+    def _position(self, domain: Any, x: float, y: float, mode: str) -> tuple[float, float]:
+        frame = self.backend.capture(domain)
+        return mouse.coordinates(x, y, frame.width, frame.height, mode)
+
+    def mouse_move(self, name: str, x: float, y: float, coordinate_mode: str = 'pixels') -> dict[str, bool]:
+        with self._action(name, cleanup=True) as (_, domain):
+            position = self._position(domain, x, y, coordinate_mode)
+            self.backend.input(domain, mouse.move_events(*position))
+        return {'moved': True}
+
+    def mouse_click(self, name: str, button: str = 'left', x: float | None = None, y: float | None = None, state: str = 'click', count: int = 1, coordinate_mode: str = 'pixels') -> dict[str, Any]:
+        mouse.validate_button(button)
+        self._validate_state(state)
+        integer(count, 'count', 1, 2)
+        if state != 'click' and count != 1:
+            raise ValueError('Held button states require count=1')
+        if (x is None) != (y is None):
+            raise ValueError('Provide both x and y, or neither')
+        if coordinate_mode not in ('pixels', 'normalized'):
+            raise ValueError('coordinate_mode must be pixels or normalized')
+        with self._action(name, cleanup=True) as (attached, domain):
+            if x is not None and y is not None:
+                position = self._position(domain, x, y, coordinate_mode)
+                self.backend.input(domain, mouse.move_events(*position))
+            if state == 'release':
+                attached.inputs.release(domain, 'btn', button)
+            else:
+                if state == 'click' and ('btn', button) in attached.inputs.held:
+                    raise ValueError('Button already held. Release it before clicking.')
+                for index in range(count):
+                    attached.inputs.press(domain, 'btn', button)
+                    if state == 'click':
+                        time.sleep(KEY_HOLD_S)
+                        attached.inputs.release(domain, 'btn', button)
+                    if index + 1 < count:
+                        time.sleep(CLICK_GAP_S)
+        return {'state': state, 'count': count}
+
+    def mouse_scroll(self, name: str, delta_y: int, delta_x: int = 0) -> dict[str, int]:
+        integer(delta_y, 'delta_y', -100, 100)
+        integer(delta_x, 'delta_x', -100, 100)
+        with self._action(name, cleanup=True) as (attached, domain):
+            for delta, positive, negative in [(delta_y, 'wheel-down', 'wheel-up'), (delta_x, 'wheel-right', 'wheel-left')]:
+                button = positive if delta > 0 else negative
+                for _ in range(abs(delta)):
+                    attached.inputs.press(domain, 'btn', button)
+                    attached.inputs.release(domain, 'btn', button)
+        return {'delta_y': delta_y, 'delta_x': delta_x}
+
+    def mouse_drag(self, name: str, start_x: float, start_y: float, end_x: float, end_y: float, button: str = 'left', duration_ms: float = 500, coordinate_mode: str = 'pixels') -> dict[str, bool]:
+        mouse.validate_button(button)
+        bounded_number(duration_ms, 'duration_ms', 0, 10000)
+        with self._action(name, cleanup=True) as (attached, domain):
+            frame = self.backend.capture(domain)
+            start = mouse.coordinates(start_x, start_y, frame.width, frame.height, coordinate_mode)
+            end = mouse.coordinates(end_x, end_y, frame.width, frame.height, coordinate_mode)
+            if ('btn', button) in attached.inputs.held:
+                raise ValueError('Button already held. Release it before dragging.')
+            self.backend.input(domain, mouse.move_events(*start))
             try:
-                vm.proc.wait(timeout=kill_timeout_s)
-            except subprocess.TimeoutExpired:
-                vm.proc.kill()
-                vm.proc.wait()
-            outcome = "killed" if force else "ACPI ignored, killed"
-    # By now the VM is no longer running (or never was), so any in-flight
-    # qemu_wait_serial/qemu_wait_screen/qemu_screenshot/qemu_qmp/
-    # qemu_serial_send call against it should notice on its own very next
-    # poll/read/write and return cleanly. Wait briefly for that before
-    # closing qmp/serial_console or removing workdir out from under it -
-    # see _wait_until_not_in_use's own docstring for why this is
-    # best-effort/bounded, not a guarantee.
-    _wait_until_not_in_use(name)
-    vm.qmp.close()
-    vm.serial_console.close()
-    with _vms_lock:
-        _vms.pop(name, None)
-    shutil.rmtree(vm.workdir, ignore_errors=True)
-    return outcome
+                attached.inputs.press(domain, 'btn', button)
+                steps = max(1, round(duration_ms / 20))
+                for step in range(1, steps + 1):
+                    time.sleep(duration_ms / 1000 / steps)
+                    position = tuple(a + (b - a) * step / steps for a, b in zip(start, end))
+                    self.backend.input(domain, mouse.move_events(*position))
+            finally:
+                attached.inputs.release(domain, 'btn', button)
+        return {'dragged': True}

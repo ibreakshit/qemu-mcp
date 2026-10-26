@@ -1,3 +1,3 @@
-"""qemu-mcp: MCP server for booting and driving QEMU virtual machines."""
+"""qemu-mcp: Local MCP controller for existing libvirt QEMU domains."""
 
 __version__ = "0.1.0"

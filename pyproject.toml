@@ -1,16 +1,17 @@
 [project]
 name = "qemu-mcp"
 version = "0.1.0"
-description = "MCP server that lets AI agents boot and drive QEMU virtual machines - keystrokes, screenshots, serial console, QMP."
+description = "Local Linux MCP controller for existing libvirt QEMU domains: lifecycle, screenshots and input."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "0xmortuex" }]
 requires-python = ">=3.10"
-dependencies = ["mcp>=2.0.0", "pillow>=10.0"]
-keywords = ["mcp", "qemu", "osdev", "virtual-machine", "ai-agent"]
+dependencies = ["mcp>=2.3.0", "pillow>=10.0", "libvirt-python>=9.0; sys_platform == 'linux'"]
+keywords = ["mcp", "qemu", "libvirt", "virtual-machine", "ai-agent"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -22,7 +23,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "ruff==0.16.0", "mypy==2.3.0"]
 
 [project.urls]
 Homepage = "https://github.com/0xmortuex/qemu-mcp"

@@ -1,69 +1,41 @@
-"""MCP stdio handshake smoke test: spawns the real server subprocess over
-stdio, initializes a client session, and checks the tool list. No QEMU
-needed - this only exercises the MCP transport/registration, never boots a VM.
-"""
-
+"""Real MCP stdio handshake and actionable errors, without libvirt."""
+import os
 import sys
 
 import pytest
-
-pytest.importorskip("mcp")
-
-from mcp import ClientSession  # noqa: E402
-from mcp.client.stdio import StdioServerParameters, stdio_client  # noqa: E402
+from mcp import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
 
 EXPECTED_TOOLS = {
-    "qemu_boot",
-    "qemu_version",
-    "qemu_screenshot",
-    "qemu_type",
-    "qemu_key",
-    "qemu_mouse",
-    "qemu_snapshot_save",
-    "qemu_snapshot_load",
-    "qemu_snapshot_delete",
-    "qemu_snapshot_list",
-    "qemu_serial",
-    "qemu_serial_send",
-    "qemu_wait_serial",
-    "qemu_wait_screen",
-    "qemu_list",
-    "qemu_stop",
-    "qemu_qmp",
+    'qemu_list', 'qemu_attach', 'qemu_detach', 'qemu_status', 'qemu_start',
+    'qemu_shutdown', 'qemu_reboot', 'qemu_force_stop', 'qemu_screenshot',
+    'qemu_get_resolution', 'qemu_wait_screen', 'qemu_type', 'qemu_key',
+    'qemu_release_all', 'qemu_mouse_move', 'qemu_mouse_click', 'qemu_mouse_scroll',
+    'qemu_mouse_drag',
 }
+
+
+def parameters():
+    return StdioServerParameters(command=sys.executable, args=['-m', 'qemu_mcp'], env={**os.environ})
 
 
 @pytest.mark.anyio
 async def test_stdio_handshake_lists_expected_tools():
-    params = StdioServerParameters(command=sys.executable, args=["-m", "qemu_mcp"])
-    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
-        init_result = await session.initialize()
-        assert init_result.server_info.name == "qemu"
-
-        tools = await session.list_tools()
-        names = {t.name for t in tools.tools}
-        assert names == EXPECTED_TOOLS, (
-            f"missing: {EXPECTED_TOOLS - names}, unexpected: {names - EXPECTED_TOOLS}"
-        )
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
+    async with stdio_client(parameters()) as (read, write), ClientSession(read, write) as session:
+        result = await session.initialize()
+        assert result.server_info.name == 'qemu'
+        assert {tool.name for tool in (await session.list_tools()).tools} == EXPECTED_TOOLS
 
 
 @pytest.mark.anyio
 async def test_instructive_errors_reach_the_agent():
-    """MCPServer hides any exception that isn't a ToolError behind a generic
-    "Error executing tool X" - so the guidance in our errors ("no VM named",
-    "Found on this system: ...") must be converted to survive the trip."""
-    params = StdioServerParameters(command=sys.executable, args=["-m", "qemu_mcp"])
-    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+    async with stdio_client(parameters()) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
-
-        result = await session.call_tool("qemu_stop", {"name": "nope"})
+        result = await session.call_tool('qemu_status', {'name': 'unattached'})
         assert result.is_error
-        assert result.content[0].text.endswith("no VM named 'nope'")
-
-        result = await session.call_tool("qemu_boot", {"name": "a/b", "kernel": "x"})
-        assert result.is_error and "invalid VM name 'a/b'" in result.content[0].text
+        assert 'qemu_attach' in result.content[0].text
+        result = await session.call_tool('qemu_type', {'name': 'unattached', 'text': 'secret☃'})
+        assert result.is_error
+        assert 'ANSI US' in result.content[0].text
+        assert 'secret' not in result.content[0].text
+        assert '☃' not in result.content[0].text

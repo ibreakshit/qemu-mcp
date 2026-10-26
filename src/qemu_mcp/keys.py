@@ -1,6 +1,6 @@
 """Character / key-name -> QMP qcode translation.
 
-QMP's `send-key` takes qcodes (QKeyCode names). Typing text means
+QMP input key events take qcodes (QKeyCode names). Typing text means
 mapping each character to its base key plus shift when needed; key
 combos like "ctrl-alt-f1" map each part to a qcode and press them
 together.
@@ -35,6 +35,9 @@ _NAMED = {
     "home": "home", "end": "end", "pgup": "pgup", "pgdn": "pgdn",
     "pageup": "pgup", "pagedown": "pgdn",
     "ctrl": "ctrl", "control": "ctrl", "alt": "alt", "shift": "shift",
+    "rightalt": "alt_r", "ralt": "alt_r", "alt_r": "alt_r", "altgr": "alt_r",
+    "rightctrl": "ctrl_r", "rctrl": "ctrl_r", "ctrl_r": "ctrl_r",
+    "rightshift": "shift_r", "rshift": "shift_r", "shift_r": "shift_r",
     "meta": "meta_l", "win": "meta_l", "super": "meta_l",
     "capslock": "caps_lock", "menu": "menu", "prtsc": "print",
 }

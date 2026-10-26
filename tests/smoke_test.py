@@ -1,87 +1,66 @@
-"""End-to-end smoke test: boots a real guest and exercises every tool.
+"""Opt-in MCP exercise of an existing guest; safe to collect with pytest.
 
-Needs a bootable image. Point QEMU_MCP_TEST_ISO at any bootable ISO
-(a hobby-OS ISO, an Alpine netboot ISO, anything that draws to VGA):
-
-    QEMU_MCP_TEST_ISO=path/to/os.iso python tests/smoke_test.py
-
-qemu_snapshot_save/qemu_snapshot_list/qemu_snapshot_load/qemu_snapshot_delete
-need a qcow2 disk instead of an ISO, so they're only exercised if
-QEMU_MCP_TEST_QCOW2 is also set, against a second VM booted from that disk:
-
-    QEMU_MCP_TEST_ISO=path/to/os.iso QEMU_MCP_TEST_QCOW2=path/to/disk.qcow2 \\
-        python tests/smoke_test.py
-
-Calls the tool functions directly (no MCP transport) - transport is the
-SDK's job; this verifies the QEMU/QMP plumbing on your machine.
+Run: python tests/smoke_test.py --name EXISTING_DOMAIN --output screenshot.png
+Add --exercise-input to send Shift and a pointer move. No power/snapshot changes.
 """
+from __future__ import annotations
 
+import argparse
+import base64
 import os
 import sys
-import time
+from pathlib import Path
+from typing import Any
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+import anyio
+from mcp import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.types import ImageContent, TextContent
 
-from qemu_mcp import server  # noqa: E402
 
-ISO = os.environ.get("QEMU_MCP_TEST_ISO")
-if not ISO:
-    sys.exit("set QEMU_MCP_TEST_ISO to a bootable ISO path")
+async def exercise(name: str, output: Path, exercise_input: bool) -> None:
+    parameters = StdioServerParameters(command=sys.executable, args=['-m', 'qemu_mcp'], env={**os.environ})
+    async with stdio_client(parameters) as (read, write), ClientSession(read, write) as session:
+        await session.initialize()
 
-ARCH = os.environ.get("QEMU_MCP_TEST_ARCH", "x86_64")
-OUT = os.environ.get("QEMU_MCP_TEST_SHOT", os.path.join(os.path.dirname(__file__), "smoke.png"))
-DISK = os.environ.get("QEMU_MCP_TEST_QCOW2")  # optional: a qcow2 disk, to also exercise snapshots
+        async def call(tool: str, arguments: dict[str, Any]) -> Any:
+            result = await session.call_tool(tool, arguments)
+            if result.is_error:
+                message = ' '.join(item.text for item in result.content if isinstance(item, TextContent))
+                raise RuntimeError(f'{tool}: {message}')
+            print(f'{tool}: OK')
+            return result
 
-print(server.qemu_version(arch=ARCH))
+        await call('qemu_list', {})
+        await call('qemu_attach', {'name': name})
+        try:
+            await call('qemu_status', {'name': name})
+            if exercise_input:
+                await call('qemu_key', {'name': name, 'combo': 'shift'})
+                await call('qemu_mouse_move', {'name': name, 'x': 0, 'y': 0})
+            await call('qemu_get_resolution', {'name': name})
+            settled = await call('qemu_wait_screen', {'name': name, 'timeout_s': 5, 'poll_interval_s': 0.5})
+            for item in settled.content:
+                if isinstance(item, TextContent):
+                    print(item.text)
+            screenshot = await call('qemu_screenshot', {'name': name})
+            images = [item for item in screenshot.content if isinstance(item, ImageContent)]
+            if len(images) != 1:
+                raise RuntimeError('Expected one primary-display PNG')
+            output.write_bytes(base64.b64decode(images[0].data))
+            print(f'PNG saved to {output}')
+        finally:
+            await call('qemu_detach', {'name': name})
 
-print(server.qemu_boot(name="smoke", iso=ISO, arch=ARCH, memory_mb=256))
-print(server.qemu_list())
 
-print(server.qemu_wait_screen(name="smoke", timeout_s=15, poll_interval_s=1.0, stable_polls=2))
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--name', required=True, help='Existing domain name or UUID')
+    parser.add_argument('--output', type=Path, default=Path('screenshot.png'))
+    parser.add_argument('--exercise-input', action='store_true', help='Explicitly send Shift and move pointer to the top-left')
+    arguments = parser.parse_args()
+    anyio.run(exercise, arguments.name, arguments.output, arguments.exercise_input)
 
-shot = server.qemu_screenshot(name="smoke")
-png = shot.data
-assert png[:8] == b"\x89PNG\r\n\x1a\n", "screendump did not produce a PNG"
-with open(OUT, "wb") as f:
-    f.write(png)
-print(f"screenshot 1: {len(png)} bytes -> {OUT}")
 
-print(server.qemu_key(name="smoke", combo="esc"))
-print(server.qemu_type(name="smoke", text="help\n"))
-time.sleep(1)
-print(server.qemu_type(name="smoke", text="help\n"))
-time.sleep(1)
-
-shot2 = server.qemu_screenshot(name="smoke")
-with open(OUT.replace(".png", "-2.png"), "wb") as f:
-    f.write(shot2.data)
-print(f"screenshot 2: {len(shot2.data)} bytes")
-
-print(server.qemu_mouse(name="smoke", x=0.5, y=0.5))
-print(server.qemu_mouse(name="smoke", x=0.3, y=0.3, button="left"))
-
-# Marker is arbitrary and unlikely to appear - exercises the timeout path
-# without assuming anything about what this particular ISO prints.
-print(server.qemu_wait_serial(name="smoke", text="qemu-mcp-smoke-marker", timeout_s=2))
-
-print(server.qemu_serial_send(name="smoke", text="\n"))
-time.sleep(1)
-print("serial tail:", server.qemu_serial(name="smoke", tail_lines=5)[:400])
-print(server.qemu_qmp(name="smoke", command="query-status"))
-print(server.qemu_stop(name="smoke", force=True))
-print(server.qemu_list())
-
-if DISK:
-    print(server.qemu_boot(name="smoke-snap", disk=DISK, arch=ARCH, memory_mb=256))
-    print(server.qemu_snapshot_save(name="smoke-snap", tag="smoke-tag"))
-    print(server.qemu_snapshot_list(name="smoke-snap"))
-    print(server.qemu_snapshot_load(name="smoke-snap", tag="smoke-tag"))
-    print(server.qemu_snapshot_delete(name="smoke-snap", tag="smoke-tag"))
-    print(server.qemu_stop(name="smoke-snap", force=True))
-else:
-    print(
-        "skipping qemu_snapshot_save/qemu_snapshot_list/qemu_snapshot_load/"
-        "qemu_snapshot_delete: set QEMU_MCP_TEST_QCOW2 to a qcow2 disk to exercise them"
-    )
-
-print("SMOKE OK")
+if __name__ == '__main__':
+    main()
