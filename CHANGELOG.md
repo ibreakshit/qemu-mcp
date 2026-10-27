@@ -3,11 +3,60 @@
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-This project has not yet made a versioned release, so everything so far is
-listed under [Unreleased]; see `BACKLOG.md` for verification detail (what
-was tested, what still needs a real QEMU boot) behind each entry.
+This project has not yet made a versioned release. Current behavior is described
+under [Unreleased]; superseded prototype work is retained separately below.
 
 ## [Unreleased]
+
+### Added
+
+- Existing local libvirt domain discovery and UUID-based attachment, status,
+  start, graceful shutdown/reboot and explicit force-stop tools.
+- Primary-display PNG capture with dimensions and screen-stability reporting.
+- Explicit keyboard and mouse tools, including held-input release, pixel or
+  normalized pointer coordinates, scrolling and dragging.
+- `qemu-credential` CLI for metadata-only 1Password item/field discovery and
+  delivery of a selected field through the existing guest keyboard path.
+  Configuration limits it to `Agents` and `Shared Vault` and VM aliases bound
+  to UUIDs; optional Secret Service keyring authentication supports a service account.
+
+### Changed
+
+- The Linux-only MVP controls existing domains through public libvirt APIs and
+  `libvirt_qemu.qemuMonitorCommand`; it coexists with virt-manager/SPICE and
+  does not access libvirt's private QMP socket or change guest devices.
+- Attachments retain UUID identity across renames and connection recovery.
+  Detach and server exit release input best-effort without powering off guests.
+- Keyboard input uses physical ANSI US positions and a minimum 20 ms interval
+  between events; tool results report transport acceptance, not verified guest text.
+- Screenshots never wake a sleeping display. Screen waits report settled/timeout,
+  black-image detection and `readiness="unknown"`, rather than OS readiness.
+- CI runs on Ubuntu only across Python 3.10-3.13, with ruff, strict mypy,
+  fake-libvirt unit tests and a real stdio MCP handshake; it requires no live guest.
+- Package version remains 0.1.0 despite the intentional interface break.
+
+### Fixed
+
+- Validate text and pointer input before sending events; serialize input per
+  domain within one controller instance, release held input best-effort on errors
+  and never replay uncertain input.
+- Graceful lifecycle requests report actual current state without a forced fallback.
+- Credential delivery validates the full value as printable US ASCII, excludes
+  archived or out-of-scope items, and reports fixed JSON errors without values or
+  upstream diagnostics. It rejects ambiguous fields and multiple-OTP selection.
+
+### Removed
+
+- Prototype VM creation/boot, QEMU-version, serial, snapshot and raw-QMP tools,
+  plus the old combined mouse and stop APIs. See the current tool table in
+  [README.md](README.md) for supported replacements.
+
+## Historical prototype (superseded)
+
+These unreleased prototype entries preserve the earlier implementation history.
+They do not describe the current API or platform support. Historical verification
+notes remain in [BACKLOG.md](BACKLOG.md); current checks are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Added
 - `qemu_boot`, `qemu_stop`, `qemu_list`, `qemu_qmp` — boot, stop, list, and
@@ -58,9 +107,10 @@ was tested, what still needs a real QEMU boot) behind each entry.
   blinking text-mode cursor flips ~18 pixels forever, so text consoles never settled.
 - Migrated from `FastMCP` to the `mcp` 2.0 `MCPServer` API and dropped the
   temporary `mcp<2.0.0` pin put in place when 2.0 first broke the import.
-- CI now runs ruff, `mypy --strict`, the unit tests, and a real stdio MCP
+- Prototype CI ran ruff, `mypy --strict`, the unit tests, and a real stdio MCP
   handshake on ubuntu/windows/macos across Python 3.10-3.13, with
   Dependabot watching both the `pip` and `github-actions` ecosystems.
+  This multi-OS configuration is superseded by the current Ubuntu-only matrix.
 - Added a PyPI trusted-publishing (OIDC) release workflow and verified
   `python -m build`/`twine check` output; the package is not yet published.
 - Added a `py.typed` marker (PEP 561) so type checkers recognize that

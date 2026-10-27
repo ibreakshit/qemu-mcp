@@ -59,7 +59,7 @@ Stopped guests can attach for power management. `qemu_start` starts an existing 
 | `qemu_mouse_scroll(name, delta_y, delta_x=0)` | Signed integer wheel steps; positive down/right, up to 100 per axis |
 | `qemu_mouse_drag(name, start_x, start_y, end_x, end_y, button='left', duration_ms=500, coordinate_mode='pixels')` | Serialized move, press, interpolated movement and final release |
 
-Input actions run sequentially per domain; different domains are independent. On input errors, held-input cleanup is attempted and uncertain input is never replayed automatically. Subsequent requests reconnect when the connection has failed and resolve attachments by UUID.
+Input actions run sequentially per domain within one server/controller instance; different domains are independent. Separate helper processes, other server instances and human viewers do not share that input lock. On input errors, held-input cleanup is attempted and uncertain input is never replayed automatically. Subsequent requests reconnect when the connection has failed and resolve attachments by UUID.
 
 ### Input coordinates and layout
 
@@ -74,6 +74,91 @@ Mouse buttons are left/right/middle; click count is 1 or 2, held states require 
 ### Screens and readiness
 
 Screenshots are read-only and never wake the display. A black frame can mean display sleep. Send explicit input if you want to wake the guest, then allow it to settle. `qemu_wait_screen` measures image stability, not application or OS readiness, and always reports `readiness="unknown"`. Its timeout is 0.01..300 seconds, polling interval 0.01..300 seconds, and stable polls 1..1000. Synchronous libvirt calls remain subject to the daemon's own response time.
+
+## Credential CLI
+
+Installing this package also installs `qemu-credential`, a local CLI that reads an authorized 1Password field and types it through the existing libvirt keyboard path. Install the 1Password CLI (`op`) separately and make it available on `PATH`. This helper is separate from the MCP tool interface. Local agent skills are not bundled or published in this repository.
+
+### Configuration and authentication
+
+Create `~/.config/qemu-credential/config.json` with this structure. All identifiers below are synthetic; replace them with your account, vault and existing VM identifiers:
+
+```json
+{
+  "account": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  "vaults": [
+    {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaa", "name": "Agents"},
+    {"id": "bbbbbbbbbbbbbbbbbbbbbbbbbb", "name": "Shared Vault"}
+  ],
+  "libvirt_uri": "qemu:///system",
+  "vms": {
+    "windows-demo": "12345678-1234-5678-9abc-123456789abc"
+  },
+  "service_account_keyring": false
+}
+```
+
+`account` is the 26-character alphanumeric account UUID; uppercase letters are valid. `vaults` must contain exactly two distinct 26-character lowercase alphanumeric IDs, with the names `Agents` and `Shared Vault` exactly once each. `vms` maps nonempty CLI aliases to existing libvirt domain UUIDs, rather than domain names. `libvirt_uri` defaults to `qemu:///system` and also accepts `qemu:///session`; remote URIs are rejected. The optional boolean `service_account_keyring` defaults to `false`. Pass `--config PATH` before or after the subcommand to use another configuration file. This CLI configuration is independent of the MCP server's environment setting.
+
+With `service_account_keyring: false`, the helper uses the preauthenticated 1Password CLI session or an inherited `OP_SERVICE_ACCOUNT_TOKEN`. It explicitly selects the configured account and vaults and excludes archived items. For a service account, grant read-only access to the custom `Agents` and `Shared Vault` vaults. The default 1Password `Shared` vault is ineligible for service-account access; create a custom vault named `Shared Vault` instead.
+
+To store a service-account token in the desktop Secret Service keyring, use a Linux desktop session with an available, unlocked keyring. On Ubuntu, the optional dependencies and a virtual environment that can import the system GI bindings can be installed as follows (from the repository):
+
+```sh
+sudo apt install libvirt-dev pkg-config python3-dev python3-venv python3-gi gir1.2-secret-1 gnome-keyring
+/usr/bin/python3 -m venv --system-site-packages .venv
+. .venv/bin/activate
+python -m pip install .
+```
+
+The 1Password CLI is still installed separately. Run this snippet locally in an interactive terminal, using that same Python environment. It accepts the token through hidden input, stores it in the keyring and prints only a success message. Do not put the token in command arguments, environment dumps or files.
+
+```sh
+python - <<'PYTHON'
+import getpass
+import warnings
+import gi
+
+gi.require_version("Secret", "1")
+from gi.repository import Secret
+
+attributes = {"application": "qemu-credential", "credential": "service-account"}
+schema = Secret.Schema.new(
+    "local.qemu-credential",
+    Secret.SchemaFlags.NONE,
+    {name: Secret.SchemaAttributeType.STRING for name in attributes},
+)
+warnings.simplefilter("error", getpass.GetPassWarning)
+with open("/dev/tty", "w") as terminal:
+    token = getpass.getpass("1Password service-account token: ", stream=terminal)
+if not token.startswith("ops_"):
+    raise ValueError("Expected a 1Password service-account token")
+if not Secret.password_store_sync(
+    schema, attributes, Secret.COLLECTION_DEFAULT,
+    "qemu-credential service account", token, None,
+):
+    raise RuntimeError("Keyring storage failed")
+print("Service-account token stored successfully.")
+PYTHON
+```
+
+The schema and both lookup attributes must match the snippet; creating an entry with only the label `qemu-credential service account` is insufficient. Set `service_account_keyring` to `true` after storing the token. In that mode, missing GI bindings, an unavailable keyring or a missing token cause `service_account_unavailable`; the helper does not fall back to desktop CLI authentication.
+
+### List and type
+
+```sh
+qemu-credential list
+qemu-credential list --item cccccccccccccccccccccccccc
+qemu-credential type --vm windows-demo --item cccccccccccccccccccccccccc
+qemu-credential type --vm windows-demo --item cccccccccccccccccccccccccc --field username
+qemu-credential type --vm windows-demo --item cccccccccccccccccccccccccc --field otp
+```
+
+`list` returns JSON item metadata (`id`, `title`, `vault` and `category`) from the two configured vaults. `list --item ID` adds field metadata (`id`, `label` and `type`), without field values. Item selection requires a current item UUID. `type` requires `--vm` and `--item`; `--field` defaults to `password`. A field ID takes priority, then an exact unique label. `otp` also selects an OTP field when no ID or label matches. OTP delivery requires exactly one OTP field in the item because `op --otp` cannot select between multiple OTP fields.
+
+Typing returns only `{"typed": true, "guest_text_verified": false}` on success. Failures return a fixed JSON error code/message and exit nonzero, without printing the selected value or upstream diagnostics. The entire nonempty value must be printable US ASCII (space through `~`); controls, including Tab, Enter and DEL, and non-ASCII text are rejected before typing.
+
+The caller must focus the intended field, choose a compatible guest keyboard layout/IME and pause all competing guest input before invoking `type`. Separate helper processes, MCP servers and human viewers do not share an input lock. The helper does not clear fields, press Enter, take screenshots or retry input. If it reports `input_may_be_partial`, inspect the field before any manual retry. Transport acceptance does not guarantee the guest received the intended text. This local helper does not provide an isolation boundary against trusted code running as the same host user.
 
 ## Compatibility and testing
 
