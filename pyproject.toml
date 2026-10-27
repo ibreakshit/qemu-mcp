@@ -30,6 +30,7 @@ Homepage = "https://github.com/0xmortuex/qemu-mcp"
 
 [project.scripts]
 qemu-mcp = "qemu_mcp.server:main"
+qemu-credential = "qemu_mcp.credentials:main"
 
 [build-system]
 requires = ["hatchling"]
