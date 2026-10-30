@@ -304,6 +304,23 @@ def test_item_detail_exposes_field_descriptors_without_values(capsys, configurat
     assert '--format=json' in op.calls[-1][0]
 
 
+@pytest.mark.parametrize('label', [None, ''])
+def test_item_detail_accepts_unlabeled_extra_fields(capsys, configuration, op, label):
+    op.details['fields'].append({'id': '', 'label': label, 'type': 'STRING', 'value': SECRET})
+    code, result = invoke(capsys, configuration, 'list', '--item', ITEM)
+    assert code == 0
+    assert result['fields'][-1] == {'id': '', 'label': '', 'type': 'STRING'}
+
+
+def test_unlabeled_extra_fields_do_not_block_password_delivery(capsys, configuration, op, guest):
+    op.details['fields'][1]['value'] = 'Ab1'
+    op.details['fields'].append({'id': '', 'type': 'STRING', 'value': SECRET})
+    code, result = invoke(capsys, configuration, 'type', '--vm', 'desktop', '--item', ITEM, '--field', 'password')
+    assert code == 0
+    assert result == {'typed': True, 'guest_text_verified': False}
+    assert pressed(guest) == ['shift', 'a', 'b', '1']
+
+
 @pytest.mark.parametrize('mutation', ['outside', 'wrong_id', 'archived'])
 def test_item_detail_rejects_mismatched_or_archived_response(capsys, configuration, op, mutation):
     if mutation == 'outside':

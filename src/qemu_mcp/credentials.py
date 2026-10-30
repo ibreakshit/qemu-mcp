@@ -1,4 +1,4 @@
-"""Deliver an authorized 1Password field through the existing guest keyboard."""
+"""Deliver an authorized 1Password field through native guest keyboard or mouse input."""
 from __future__ import annotations
 
 import argparse
@@ -13,6 +13,7 @@ from typing import Any, NoReturn, Sequence
 from uuid import UUID
 
 from . import keys
+from . import credential_keyboard
 from .backend import LibvirtBackend
 from .vm import Controller
 
@@ -31,6 +32,10 @@ _MESSAGES = {
     'input_may_be_partial': 'Guest input may be partial. Check the focused field before any manual retry.',
     'interrupted': 'The request was interrupted before guest input.',
     'op_failed': '1Password returned an invalid response. Check CLI access and try again.',
+    'invalid_keyboard_profile': 'Enroll a valid public keyboard layout for this VM and display.',
+    'keyboard_layout_changed': 'Keyboard images changed or are ambiguous. Recheck the screen before enrolling again.',
+    'keyboard_not_settled': 'Keyboard did not settle. Check the screen; no automatic retry was attempted.',
+    'keyboard_character_unavailable': 'The saved value requires characters unavailable through the enrolled keyboard layers.',
 }
 
 
@@ -45,7 +50,9 @@ class JsonParser(argparse.ArgumentParser):
         raise CredentialError('invalid_arguments')
 
     def print_help(self, file: Any = None) -> None:
-        print(json.dumps({'usage': 'qemu-credential {list,type} [--config PATH] [--vm NAME] [--item ID] [--field password]'}))
+        print(json.dumps({'usage': 'qemu-credential {list,type,inspect-keyboard,enter-keyboard} '
+                          '[--config PATH] [--vm NAME] [--item ID] [--field password] '
+                          '[--profile PATH] [--layout PATH] [--state default] [--settle-ms 250]'}))
 
 
 @dataclass(frozen=True)
@@ -180,9 +187,11 @@ def _item(configuration: Configuration, identifier: str, items: list[dict[str, A
 def _fields(details: dict[str, Any]) -> list[dict[str, Any]]:
     fields = details.get('fields', [])
     if (not isinstance(fields, list) or any(not isinstance(field, dict)
-            or any(not isinstance(field.get(key), str) for key in ('id', 'label', 'type')) for field in fields)):
+            or any(not isinstance(field.get(key), str) for key in ('id', 'type'))
+            or (field.get('label') is not None and not isinstance(field['label'], str)) for field in fields)):
         raise CredentialError('op_failed')
-    return fields
+    # Saved web-form fields can omit labels; retain their IDs without exposing values.
+    return [{**field, 'label': field.get('label') or ''} for field in fields]
 
 
 def _value(configuration: Configuration, metadata: dict[str, Any], details: dict[str, Any], selector: str) -> str:
@@ -247,14 +256,49 @@ def _parser() -> argparse.ArgumentParser:
     # A suppressed subparser default permits --config before or after the verb.
     parser.add_argument('--config', default=str(Path('~/.config/qemu-credential/config.json')))
     commands = parser.add_subparsers(dest='command', required=True, parser_class=JsonParser)
-    for name in ('list', 'type'):
+    for name in ('list', 'type', 'inspect-keyboard', 'enter-keyboard'):
         command = commands.add_parser(name, allow_abbrev=False)
         command.add_argument('--config', default=argparse.SUPPRESS)
-        command.add_argument('--vm', required=name == 'type')
-        command.add_argument('--item', required=name == 'type')
-        if name == 'type':
+        command.add_argument('--vm', required=name != 'list')
+        command.add_argument('--item', required=name in ('type', 'enter-keyboard'))
+        if name in ('type', 'enter-keyboard'):
             command.add_argument('--field', default='password')
+        if name in ('inspect-keyboard', 'enter-keyboard'):
+            command.add_argument('--profile', required=True)
+            command.add_argument('--settle-ms', type=int, default=250)
+        if name == 'inspect-keyboard':
+            command.add_argument('--layout', required=True)
+            command.add_argument('--state', default='default')
     return parser
+
+
+def _keyboard(configuration: Configuration, arguments: Any, value: str | None = None) -> dict[str, Any]:
+    controller: Controller | None = None
+    try:
+        binding = importlib.import_module('libvirt')
+        binding.registerErrorHandler(lambda _context, _error: None, None)
+        controller = Controller(LibvirtBackend(configuration.libvirt_uri, binding=binding))
+        uuid = configuration.vms[arguments.vm]
+        if controller.attach(uuid)['uuid'] != uuid:
+            raise CredentialError('backend_failure')
+        # Keep the entire matching/input sequence under the controller's
+        # existing action lock, with held-button cleanup on failures.
+        with controller._action(uuid, cleanup=True):
+            if arguments.command == 'inspect-keyboard':
+                return credential_keyboard.enroll(controller, uuid, arguments.layout, arguments.profile,
+                                                  arguments.state, arguments.settle_ms)
+            assert value is not None
+            return credential_keyboard.enter(controller, uuid, arguments.profile, value, arguments.settle_ms)
+    except credential_keyboard.KeyboardError as error:
+        raise CredentialError(str(error)) from None
+    except (Exception, KeyboardInterrupt):
+        raise CredentialError('backend_failure') from None
+    finally:
+        if controller is not None:
+            try:
+                controller.close()
+            except (Exception, KeyboardInterrupt):
+                pass
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -265,6 +309,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise CredentialError('denied_vm')
         if arguments.item is not None and not _identifier(arguments.item):
             raise CredentialError('inaccessible_item')
+        if arguments.command in ('inspect-keyboard', 'enter-keyboard'):
+            if not 50 <= arguments.settle_ms <= 5000:
+                raise CredentialError('invalid_arguments')
+        if arguments.command == 'inspect-keyboard':
+            print(json.dumps(_keyboard(configuration, arguments)))
+            return 0
         items = _items(configuration)
         result: dict[str, Any]
         if arguments.item is None:
@@ -276,7 +326,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     {key: field[key] for key in ('id', 'label', 'type')} for field in _fields(details)]}
             else:
                 value = _value(configuration, metadata, details, arguments.field)
-                result = _type(configuration, arguments.vm, value)
+                result = (_keyboard(configuration, arguments, value) if arguments.command == 'enter-keyboard'
+                          else _type(configuration, arguments.vm, value))
         print(json.dumps(result))
         return 0
     except CredentialError as error:
